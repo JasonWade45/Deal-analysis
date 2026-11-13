@@ -1,5 +1,9 @@
 # Deal Analyzer v2.5 — Acquisitions & Wholesaling Workspace
 
+[![Deploy to GitHub Pages](https://github.com/JasonWade45/Deal-analysis/actions/workflows/deploy.yml/badge.svg)](https://github.com/JasonWade45/Deal-analysis/actions/workflows/deploy.yml)
+
+**🌐 Live site:** https://jasonwade45.github.io/Deal-analysis/
+
 A single-page real-estate deal analyzer: paste an address + seller conversation, get a **locked, deterministic**
 ARV / Rehab / MAO calculation, a tailored seller script, a live call whisperer co-pilot, and a 20x
 wholesaling power suite — with a full **interactive Arabic usage guide (📖 شرح الاستخدام)** built in.
