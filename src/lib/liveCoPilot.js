@@ -1,11 +1,9 @@
-import { formatUSD } from './dealMath.js';
-
 // ============================================================================
 // LIVE CALL WHISPERER HELPERS
 // - Script similarity / progress tracking
 // - Smart pause vs. seller interruption (barge-in) detection
 // - Seller tone detection + agent voiceprint matching
-// - Instant (<15ms) stage-aware local reply engine
+// NOTE: contextual reply generation lives in callReplyEngine.js
 // ============================================================================
 
 export function normalizeWords(str = '') {
@@ -203,116 +201,3 @@ export function isClearlyAgentSelfIntroOrPitch(text = '') {
   }
   return false;
 }
-
-export function generateInstantStageAwareReply({
-  sellerSpeech = '',
-  math,
-  address,
-  wasBargeIn = false,
-  sellerToneId = 'neutral'
-}) {
-  const lower = sellerSpeech.toLowerCase().trim();
-  const openStr = math.isComplete ? formatUSD(math.opening) : 'our initial cash estimate';
-  const targetStr = math.isComplete ? formatUSD(math.target) : 'our target cash number';
-  const repStr = math.repairs !== null ? formatUSD(math.repairs) : 'the kitchen and cosmetic work';
-  const shortAddr = address ? address.split(',')[0] : 'the property';
-
-  const bargeInPrefix = wasBargeIn
-    ? 'Oh, go right ahead—sorry to talk over you! I hear you 100%. '
-    : sellerToneId === 'defensive'
-    ? 'I hear you loud and clear, and I’m definitely not here to waste your time. '
-    : sellerToneId === 'hesitant'
-    ? 'No rush at all—let’s keep it super simple. '
-    : '';
-
-  if (
-    !wasBargeIn &&
-    /^(?:hey|hi|hello|good|doing well|fine|speaking|yes|yeah|who is this|how you doing|how are you)/i.test(lower) &&
-    lower.split(/\s+/).length <= 12 &&
-    !/\$|\d{3}|low|offer|price|kitchen|roof|month/i.test(lower)
-  ) {
-    return `Doing great, thanks for asking! I'm following up on ${shortAddr}—I know you mentioned wanting to wrap things up within the next month for your retirement without having to remodel the kitchen. Do you have two quick minutes to go over the net cash numbers I put together for you?`;
-  }
-
-  if (wasBargeIn && /^(?:wait|hold on|stop|hang on|listen|look|استنى|ثانية|لحظة)/i.test(lower) && lower.split(/\s+/).length <= 6) {
-    return `Oh, my apologies—please go ahead! What was on your mind regarding ${shortAddr}?`;
-  }
-
-  if (/low|more|insult|can't do|250|280|higher|not enough|أقل|قليل|أكتر|سعر أعلى/i.test(lower)) {
-    return `${bargeInPrefix}I appreciate that you already came down from $280k to $250k. Because your roof is 7.5 years old and the HVAC is 2.5 years old, I gave you full credit for mechanicals and can stretch our net cash offer from ${openStr} up to ${targetStr} net, closing in 21 days with zero commissions. Or if you firmly need $250,000, we can structure a simple Seller-Carry option at your price!`;
-  }
-
-  if (/zillow|redfin|realtor|agent|list|worth|market|زيلو|سمسار/i.test(lower)) {
-    return `${bargeInPrefix}Zillow's estimate assumes a brand-new remodeled kitchen. Once you deduct ${repStr} for the kitchen remodel plus 6% realtor commissions and 3 months of showings, ${targetStr} net cash puts guaranteed funds in your pocket right on your retirement schedule.`;
-  }
-
-  if (/think|talk to|brother|sister|wife|husband|spouse|tomorrow|next week|أفكر|أستشير/i.test(lower)) {
-    return `${bargeInPrefix}Take all the time you need—zero pressure at all. Let me text or email you our 1-page breakdown showing ${openStr} to ${targetStr} net cash right now so you can review the exact numbers in black and white tonight. What's the best email for you?`;
-  }
-
-  if (/fast|when|close|timeline|days|month|retir|امتى|وقت|شهر/i.test(lower)) {
-    return `${bargeInPrefix}Since we use our own cash with no bank appraisals, our local title company can close in 14 to 21 days—well inside your 30-day retirement timeline—and wire ${targetStr} net directly to your account.`;
-  }
-
-  if (/clean|stuff|furniture|repair|fix|kitchen|roof|hvac|ac\b|عفش|تصليح|مطبخ/i.test(lower)) {
-    return `${bargeInPrefix}You won't have to touch the kitchen or hire a single contractor. Because your HVAC is only 2.5 years old and the roof is 7.5 years old, we didn't deduct a dime for those—we're buying the kitchen 100% as-is at ${targetStr} net to you.`;
-  }
-
-  if (/what.*offer|how much|number|pay|give me|price|كام|عرضك/i.test(lower)) {
-    return `${bargeInPrefix}Taking the kitchen 100% as-is, covering all title and closing costs, and closing within your 30-day retirement window, we can open at ${openStr} net cash—and if we can lock in the timeline today, I can push it up to ${targetStr} net.`;
-  }
-
-  return `${bargeInPrefix}Got it—that helps me a lot. Since we cover 100% of closing costs, give you full credit for the young roof and HVAC, and take the kitchen as-is, how does ${openStr} to ${targetStr} net cash sound for a guaranteed 30-day close?`;
-}
-
-// 8 one-tap instant seller objection moments for the Live Call Whisperer.
-export const QUICK_LIVE_PROMPTS = [
-  {
-    label: '⚡ قاطعني: "Wait, $192k is too low!"',
-    shortLabel: '⚡ Barge-In: "Too low!"',
-    text: 'Wait hold on, $192,500 is way too low, I already dropped from 280 to 250,000!',
-    bargeIn: true
-  },
-  {
-    label: '👋 "Hello, who is this?"',
-    shortLabel: '👋 "Who is this?"',
-    text: 'Hey, this is the homeowner, how are you doing?',
-    bargeIn: false
-  },
-  {
-    label: '🛠️ "Roof & AC are young!"',
-    shortLabel: '🛠️ "Roof & AC young"',
-    text: 'The HVAC is only 2.5 years old and the roof is 7.5 years old, only the kitchen needs remodeling.',
-    bargeIn: false
-  },
-  {
-    label: '⏱️ "Closing in 30 days?"',
-    shortLabel: '⏱️ "Close in 30 days"',
-    text: 'I am retiring right now and need to close within the next month.',
-    bargeIn: false
-  },
-  {
-    label: '🏠 "Zillow says more"',
-    shortLabel: '🏠 "Zillow says more"',
-    text: 'Zillow says my house is worth way more than that.',
-    bargeIn: false
-  },
-  {
-    label: '🤔 "Need to think about it"',
-    shortLabel: '🤔 "Need to think"',
-    text: 'Um, I am not sure, I need to think about it and talk to my family first.',
-    bargeIn: false
-  },
-  {
-    label: '💵 "I need $250k firm"',
-    shortLabel: '💵 "Need $250k firm"',
-    text: 'I need a firm 250,000 cash, I am not taking a penny less than my asking price.',
-    bargeIn: true
-  },
-  {
-    label: '🏦 "I still owe a big payoff"',
-    shortLabel: '🏦 "Big payoff"',
-    text: 'My payoff with the bank is still around 178,000, so I need enough to clear that and walk away with something.',
-    bargeIn: false
-  }
-];
