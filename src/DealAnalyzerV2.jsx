@@ -42,6 +42,7 @@ import {
   detectSellerTypeFromConversation
 } from './lib/playbooks.js';
 import { buildBaselineAnalysis } from './lib/analysis.js';
+import { buildDealContext } from './lib/dealContext.js';
 import {
   ConfidenceBadge,
   NumericField,
@@ -93,6 +94,7 @@ export default function App() {
   const [showAdvancedInputs, setShowAdvancedInputs] = useState(false);
   const [showToolsMenu, setShowToolsMenu] = useState(false);
   const [activeTab, setActiveTab] = useState('analysis');
+  const [dealSessionId, setDealSessionId] = useState(0);
   const [customConfidenceMap, setCustomConfidenceMap] = useState({});
   const [copiedId, setCopiedId] = useState(null);
 
@@ -233,6 +235,21 @@ export default function App() {
     [address, effectiveSellerType, conversation, extraNotes, math, marketMode]
   );
 
+  // Facts the live co-pilot is allowed to use — scoped to this deal only.
+  const dealContext = useMemo(
+    () =>
+      buildDealContext({
+        address,
+        conversation,
+        extraNotes,
+        math,
+        playbook: SELLER_PLAYBOOK[effectiveSellerType] || SELLER_PLAYBOOK.distressed,
+        market: MARKET_MODES[marketMode] || MARKET_MODES.national,
+        sellerType: effectiveSellerType
+      }),
+    [address, conversation, extraNotes, math, effectiveSellerType, marketMode]
+  );
+
   const cycleConfidence = (rowKey, currentBadge) => {
     const order = ['VERIFIED', 'ESTIMATE', 'UNVERIFIED'];
     const next = order[(order.indexOf(currentBadge) + 1) % order.length];
@@ -264,6 +281,7 @@ export default function App() {
     setConversation(preset.conversation || '');
     setCustomConfidenceMap({});
     setAiError(null);
+    setDealSessionId((n) => n + 1);
 
     const presetMath = calculateDealMath({
       arvInput: preset.arv,
@@ -371,6 +389,7 @@ export default function App() {
     setCustomConfidenceMap({});
     setAiError(null);
     setActiveTab('analysis');
+    setDealSessionId((n) => n + 1);
 
     if (!silent) {
       triggerProcessPopup({
@@ -1362,12 +1381,14 @@ Seller Type: ${p.playbook.label}
 
             {activeTab === 'live' && (
               <LiveWhispererCoPilot
+                key={`live-copilot-deal-${dealSessionId}`}
                 apiKey={customGeminiKey}
                 selectedModel={selectedGeminiModel}
                 address={address}
                 playbook={SELLER_PLAYBOOK[effectiveSellerType] || SELLER_PLAYBOOK.distressed}
                 scriptPackage={dealPackage.script}
                 math={math}
+                dealContext={dealContext}
                 isLight={isLight}
                 onAppendToConversation={(newTurnText) =>
                   setConversation((prev) => (prev ? `${prev}\n${newTurnText}` : newTurnText))

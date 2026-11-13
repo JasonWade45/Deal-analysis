@@ -7,26 +7,63 @@ import {
   Bot,
   CheckCircle2,
   VolumeX,
-  Zap
+  Zap,
+  RotateCcw,
+  ShieldAlert,
+  Brain,
+  PhoneCall
 } from 'lucide-react';
 import { formatUSD } from '../lib/dealMath.js';
 import {
-  QUICK_LIVE_PROMPTS,
   analyzeScriptProgressAndBargeIn,
   calculateScriptSimilarity,
   compareWithAgentVoiceProfile,
   detectSpeakerTone,
-  generateInstantStageAwareReply,
   isClearlyAgentSelfIntroOrPitch
 } from '../lib/liveCoPilot.js';
+import {
+  INTENT_LABELS,
+  buildGeminiPrompt,
+  buildQuickPrompts,
+  detectSellerIntent,
+  generateCallOpener,
+  generateContextualReply,
+  guardModelOutput
+} from '../lib/callReplyEngine.js';
 
 // ============================================================================
-// LIVE CALL WHISPERER CO-PILOT
-// - Acoustic voiceprint calibration (Pitch Hz + Spectral Timbre + Energy)
-// - Smart Pause vs. Seller Interruption (Barge-In) Detection Engine
-// - Real-Time Seller & Agent Tone Detection + Personal Tone Preservation
-// - 8 one-tap instant seller objection moments
+// LIVE CALL WHISPERER CO-PILOT — v3 (per-deal context, per-call sessions)
+//
+// What changed:
+// - Every call starts a fresh session: clean transcript, clean intent history,
+//   fresh opener, turn counter reset. Nothing carries over between calls.
+// - Each deal is isolated: the component is keyed per deal in App, and all
+//   replies are generated from this deal's own facts (address, asking, ARV,
+//   repairs, MAO, payoff, condition, timeline) — never a hard-coded script.
+// - Replies are intent-aware and bilingual (EN / Egyptian Arabic) and avoid
+//   inventing numbers. Optional Gemini output is number-guarded.
+// - Seller speech is no longer mistaken for the agent's script: a detected
+//   seller intent wins unless the match to the agent script is very strong.
 // ============================================================================
+
+const CUE_REGEX = /\b(?:wait|hold on|stop|listen|look|no way|nah|actually|hang on|excuse me|sorry)\b|استنى|ثانية|لحظة|لا لا|بص|اسمعني/i;
+const NEUTRAL_TONE = {
+  id: 'neutral',
+  label: '🎯 هادئ / استشاري (Calm / Consultative)',
+  color: 'text-indigo-400 bg-indigo-500/15 border-indigo-500/40',
+  coaching: 'نبرة متزنة؛ التزم بأسلوبك الهادئ المباشر.'
+};
+
+function timeStamp() {
+  return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function formatDuration(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
 
 export default function LiveWhispererCoPilot({
   apiKey,
@@ -36,6 +73,7 @@ export default function LiveWhispererCoPilot({
   scriptPackage,
   math,
   isLight,
+  dealContext,
   onAppendToConversation
 }) {
   const [listenMode, setListenMode] = useState('handsfree');
@@ -45,18 +83,28 @@ export default function LiveWhispererCoPilot({
   const [liveText, setLiveText] = useState('');
   const [lastIgnoredUserText, setLastIgnoredUserText] = useState('');
   const [lastSellerText, setLastSellerText] = useState('');
-  const [aiSuggestion, setAiSuggestion] = useState(scriptPackage?.opening || '');
+  const [lastIntent, setLastIntent] = useState(null);
+  const [aiSuggestion, setAiSuggestion] = useState(
+    () => generateCallOpener(dealContext || {}, 'en') || scriptPackage?.opening || ''
+  );
   const [isAiThinking, setIsAiThinking] = useState(false);
-  const [aiSourceBadge, setAiSourceBadge] = useState('Ready');
-  const [similarityThreshold, setSimilarityThreshold] = useState(0.5);
+  const [aiSourceBadge, setAiSourceBadge] = useState('جاهز');
+  const [aiError, setAiError] = useState('');
+  const [similarityThreshold, setSimilarityThreshold] = useState(0.62);
   const [silenceDelayMs, setSilenceDelayMs] = useState(900);
   const [callLog, setCallLog] = useState([]);
   const [manualSellerInput, setManualSellerInput] = useState('');
   const [liveCustomOffer, setLiveCustomOffer] = useState(null);
+  const [callNumber, setCallNumber] = useState(0);
+  const [callStartedAt, setCallStartedAt] = useState(null);
+  const [callEndedAt, setCallEndedAt] = useState(null);
+  const [clockNow, setClockNow] = useState(Date.now());
+  const [appendToDeal, setAppendToDeal] = useState(false);
+  const [useAi, setUseAi] = useState(false);
 
   const [turnStatusBadge, setTurnStatusBadge] = useState({
     type: 'ready',
-    label: '🎧 جاهز للاستماع الذكي (يميز بين توقفك المؤقت ومقاطعة البايع)',
+    label: '🎧 جاهز — اضغط «مكالمة جديدة» ليبدأ سياق نظيف لهذه الصفقة',
     scriptProgressPct: 0
   });
 
@@ -86,20 +134,17 @@ export default function LiveWhispererCoPilot({
     voiceMatchPct: 0,
     detectedSpeaker: 'idle'
   });
-  const [detectedSellerTone, setDetectedSellerTone] = useState({
-    id: 'neutral',
-    label: '🎯 هادئ / استشاري (Calm / Consultative)',
-    color: 'text-indigo-400 bg-indigo-500/15 border-indigo-500/40',
-    coaching: 'نبرة متزنة؛ التزم بأسلوبك الهادئ المباشر.'
-  });
+  const [detectedSellerTone, setDetectedSellerTone] = useState(NEUTRAL_TONE);
 
   const recognitionRef = useRef(null);
   const expectedUserScriptRef = useRef(scriptPackage?.opening || '');
   const silenceTimerRef = useRef(null);
+  const pendingUtteranceRef = useRef(null);
   const unspokenBufferRef = useRef('');
-  const processedCharsCountRef = useRef(0);
   const isListeningRef = useRef(false);
   const muteMyVoiceRef = useRef(false);
+  const lastAgentSpeechAtRef = useRef(0);
+  const lastUtteranceRef = useRef({ text: '', at: 0 });
 
   const audioContextRef = useRef(null);
   const analyserRef = useRef(null);
@@ -108,6 +153,31 @@ export default function LiveWhispererCoPilot({
   const recentPitchSamplesRef = useRef([]);
   const liveAcousticRef = useRef(liveAcoustic);
   const agentVoiceProfileRef = useRef(agentVoiceProfile);
+
+  const lang = speechLang === 'ar-EG' ? 'ar' : 'en';
+  const ctx = useMemo(() => dealContext || {}, [dealContext]);
+  const quickPrompts = useMemo(() => buildQuickPrompts(ctx), [ctx]);
+  const contextFacts = useMemo(
+    () => [
+      { label: 'العنوان', value: ctx.shortAddress || '—' },
+      { label: 'نوع البايع', value: ctx.playbookLabel || '—' },
+      { label: 'Asking', value: ctx.asking ? formatUSD(ctx.asking) : 'غير معروف' },
+      { label: 'ARV', value: ctx.arv ? formatUSD(ctx.arv) : 'غير معروف' },
+      { label: 'Repairs', value: ctx.repairs !== null && ctx.repairs !== undefined ? formatUSD(ctx.repairs) : 'غير معروف' },
+      { label: 'MAO', value: ctx.target ? formatUSD(ctx.target) : 'ESTIMATE ONLY' },
+      { label: 'Opening', value: ctx.opening ? formatUSD(ctx.opening) : '—' },
+      { label: 'Payoff', value: ctx.payoff ? formatUSD(ctx.payoff) : 'غير معروف' },
+      { label: 'الإغلاق', value: ctx.closingDays || '—' }
+    ],
+    [ctx]
+  );
+
+  const sessionStats = useMemo(() => {
+    const sellerTurns = callLog.filter((t) => t.role === 'seller');
+    const intents = sellerTurns.map((t) => t.intent).filter(Boolean);
+    const unique = [...new Set(intents)];
+    return { sellerTurns: sellerTurns.length, uniqueIntents: unique };
+  }, [callLog]);
 
   useEffect(() => {
     muteMyVoiceRef.current = muteMyVoice;
@@ -123,11 +193,22 @@ export default function LiveWhispererCoPilot({
   }, [agentVoiceProfile]);
 
   useEffect(() => {
-    if (scriptPackage?.opening && !lastSellerText) {
-      expectedUserScriptRef.current = scriptPackage.opening;
-      setAiSuggestion(scriptPackage.opening);
-    }
-  }, [scriptPackage, lastSellerText]);
+    if (!apiKey) setUseAi(false);
+  }, [apiKey]);
+
+  useEffect(() => {
+    if (!callStartedAt) return undefined;
+    const timer = setInterval(() => setClockNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [callStartedAt]);
+
+  // Fresh suggestion whenever the deal context changes and no call is running.
+  useEffect(() => {
+    if (callStartedAt || lastSellerText) return;
+    const opener = scriptPackage?.opening || generateCallOpener(ctx, lang);
+    expectedUserScriptRef.current = opener;
+    setAiSuggestion(opener);
+  }, [scriptPackage, ctx, lang, callStartedAt, lastSellerText]);
 
   const allKnownUserScripts = useMemo(() => {
     return [
@@ -141,15 +222,14 @@ export default function LiveWhispererCoPilot({
     ].filter(Boolean);
   }, [aiSuggestion, scriptPackage]);
 
+  // -------------------------------------------------------------------------
+  // Acoustic analyzer + voiceprint (unchanged behavior, per-session)
+  // -------------------------------------------------------------------------
   const startAcousticAnalyzer = async () => {
     if (audioContextRef.current) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: false
-        }
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false }
       });
       micStreamRef.current = stream;
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -172,9 +252,7 @@ export default function LiveWhispererCoPilot({
         analyserRef.current.getFloatTimeDomainData(timeData);
 
         let sumSq = 0;
-        for (let i = 0; i < timeData.length; i++) {
-          sumSq += timeData[i] * timeData[i];
-        }
+        for (let i = 0; i < timeData.length; i++) sumSq += timeData[i] * timeData[i];
         const rms = Math.sqrt(sumSq / timeData.length);
         const energyVal = Math.min(100, Math.round(rms * 320));
 
@@ -259,16 +337,16 @@ export default function LiveWhispererCoPilot({
     setIsCalibratingVoice(true);
     await startAcousticAnalyzer();
 
-    const collectedPitches = [];
-    const collectedCentroids = [];
-    const collectedEnergies = [];
+    const pitches = [];
+    const centroids = [];
+    const energies = [];
 
     const collectInterval = setInterval(() => {
       const cur = liveAcousticRef.current;
       if (cur && cur.energy >= 8 && cur.pitchHz >= 80) {
-        collectedPitches.push(cur.pitchHz);
-        collectedCentroids.push(cur.centroidHz || 1150);
-        collectedEnergies.push(cur.energy);
+        pitches.push(cur.pitchHz);
+        centroids.push(cur.centroidHz || 1150);
+        energies.push(cur.energy);
       }
     }, 120);
 
@@ -276,20 +354,13 @@ export default function LiveWhispererCoPilot({
       clearInterval(collectInterval);
       setIsCalibratingVoice(false);
 
-      const avgPitch =
-        collectedPitches.length > 0
-          ? Math.round(collectedPitches.reduce((a, b) => a + b, 0) / collectedPitches.length)
-          : 135;
-      const avgCentroid =
-        collectedCentroids.length > 0
-          ? Math.round(collectedCentroids.reduce((a, b) => a + b, 0) / collectedCentroids.length)
-          : 1120;
-      const avgEnergy =
-        collectedEnergies.length > 0
-          ? Math.round(collectedEnergies.reduce((a, b) => a + b, 0) / collectedEnergies.length)
-          : 42;
+      const avgPitch = pitches.length ? Math.round(pitches.reduce((a, b) => a + b, 0) / pitches.length) : 135;
+      const avgCentroid = centroids.length
+        ? Math.round(centroids.reduce((a, b) => a + b, 0) / centroids.length)
+        : 1120;
+      const avgEnergy = energies.length ? Math.round(energies.reduce((a, b) => a + b, 0) / energies.length) : 42;
 
-      const inferredStyle =
+      const style =
         avgEnergy > 55
           ? 'Energetic, Direct & Confident'
           : avgPitch < 140
@@ -300,14 +371,12 @@ export default function LiveWhispererCoPilot({
         avgPitchHz: avgPitch,
         avgCentroidHz: avgCentroid,
         avgEnergy,
-        toneStyle: inferredStyle,
+        toneStyle: style,
         calibrated: true,
-        sampleCount: (agentVoiceProfileRef.current?.sampleCount || 0) + collectedPitches.length
+        sampleCount: (agentVoiceProfileRef.current?.sampleCount || 0) + pitches.length
       });
 
-      if (!isListeningRef.current) {
-        stopAcousticAnalyzer();
-      }
+      if (!isListeningRef.current) stopAcousticAnalyzer();
     }, 3600);
   };
 
@@ -327,238 +396,213 @@ export default function LiveWhispererCoPilot({
     });
   };
 
-  const getAiResponseForSeller = async (sellerText, options = {}) => {
-    const { wasBargeIn = false } = options;
-    const cleanedSellerText = (sellerText || '').trim();
-    if (cleanedSellerText.length < 2) return;
+  // -------------------------------------------------------------------------
+  // Contextual reply
+  // -------------------------------------------------------------------------
+  const pushTurn = (entry) => {
+    const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    setCallLog((prev) => [...prev, { ...entry, id, time: timeStamp() }]);
+    return id;
+  };
 
-    setLastSellerText(cleanedSellerText);
+  const replyToSeller = async (rawText, options = {}) => {
+    const text = String(rawText || '').trim();
+    if (text.length < 2) return;
+
+    const now = Date.now();
+    if (text === lastUtteranceRef.current.text && now - lastUtteranceRef.current.at < 2500) return;
+    lastUtteranceRef.current = { text, at: now };
+
+    const intentInfo = detectSellerIntent(text);
+    const sellerTone = detectSpeakerTone({
+      text,
+      pitchHz: liveAcousticRef.current.pitchHz,
+      pitchVariance: liveAcousticRef.current.pitchVariance,
+      energy: liveAcousticRef.current.energy
+    });
+    const wasBargeIn = Boolean(options.wasBargeIn);
+
+    setDetectedSellerTone(sellerTone);
+    setLastIntent(intentInfo.id);
+    setLastSellerText(text);
     setLiveText('');
     unspokenBufferRef.current = '';
-
-    const curAcoustic = liveAcousticRef.current;
-    const sellerTone = detectSpeakerTone({
-      text: cleanedSellerText,
-      pitchHz: curAcoustic.pitchHz,
-      pitchVariance: curAcoustic.pitchVariance,
-      energy: curAcoustic.energy
-    });
-    setDetectedSellerTone(sellerTone);
-
     setTurnStatusBadge({
       type: wasBargeIn ? 'seller_barge_in' : 'seller_speaking',
-      label: wasBargeIn
-        ? `⚡ قاطعك البايع أثناء كلامك! (${sellerTone.label}) — تم تعديل الرد فوراً`
-        : `🗣️ البايع أنهى كلامه (${sellerTone.label}) — اقرأ الرد الآن`,
+      label: `${wasBargeIn ? '⚡ قاطعك البايع!' : '🗣️ البايع قال:'} ${INTENT_LABELS[intentInfo.id]?.ar || ''} — الرد جاهز`,
       scriptProgressPct: 0
     });
 
-    const instantLocalReply = generateInstantStageAwareReply({
-      sellerSpeech: cleanedSellerText,
-      math,
-      playbook,
-      address,
+    const local = generateContextualReply({
+      intent: intentInfo.id,
+      sellerSpeech: text,
+      ctx,
       wasBargeIn,
-      sellerToneId: sellerTone.id
+      sellerToneId: sellerTone.id,
+      lang,
+      turn: callLog.filter((t) => t.role === 'seller').length
     });
-    setAiSuggestion(instantLocalReply);
-    setAiSourceBadge(wasBargeIn ? '⚡ Barge-In Pivot (<15ms)' : '⚡ Instant (<15ms)');
-    expectedUserScriptRef.current = instantLocalReply;
+
+    setAiSuggestion(local.text);
+    expectedUserScriptRef.current = local.text;
+    setAiSourceBadge(wasBargeIn ? '⚡ رد سياقي (مقاطعة)' : '⚡ رد سياقي فوري');
+    setAiError('');
+
+    pushTurn({
+      role: 'seller',
+      text,
+      tone: sellerTone.label,
+      intent: intentInfo.id,
+      wasBargeIn,
+      source: 'mic'
+    });
+    const copilotId = pushTurn({ role: 'copilot', text: local.text, source: 'local' });
+
+    if (appendToDeal && onAppendToConversation) {
+      onAppendToConversation(
+        `Seller (${wasBargeIn ? 'interrupted' : 'live'} • ${intentInfo.id}): ${text}\nMe (co-pilot): ${local.text}`
+      );
+    }
+
+    if (!useAi || !apiKey) return;
 
     setIsAiThinking(true);
-    const openStr = math.isComplete ? formatUSD(math.opening) : 'ESTIMATE ONLY';
-    const targetStr = math.isComplete ? formatUSD(math.target) : 'ESTIMATE ONLY';
-    const walkStr = math.isComplete ? formatUSD(math.walkAway) : 'ESTIMATE ONLY';
-    const repStr = math.repairs !== null ? formatUSD(math.repairs) : 'ESTIMATE ONLY';
-
-    const recentTurns = callLog
-      .slice(-4)
-      .map((t) => `${t.role === 'seller' ? 'Seller' : 'Agent'}: ${t.text}`)
-      .join('\n');
-
-    const prompt = `You are a real-time live phone call whisperer for a real estate wholesaling acquisitions agent.
-Property: ${address}
-Seller Type: ${playbook.label} (${playbook.tone})
-Known Deal Facts: Seller is retiring, wants to close in ~30 days, dropped price from $280k to $250k. Kitchen needs remodeling, but HVAC (2.5 yrs old) and Roof (7.5 yrs old) are in great shape.
-
-AGENT'S SAVED VOICE & TONE PROFILE (WRITE IN THIS EXACT PERSONAL STYLE):
-- Agent Tone Style: ${agentVoiceProfileRef.current?.toneStyle || 'Calm, Consultative & Empathetic'} (Pitch ~${agentVoiceProfileRef.current?.avgPitchHz || 135}Hz)
-
-SELLER'S LIVE DETECTED EMOTIONAL TONE & TURN CONTEXT:
-- Seller Current Tone: ${sellerTone.label} (${sellerTone.coaching})
-- Did Seller Interrupt / Barge-In Mid-Sentence?: ${wasBargeIn ? 'YES — The seller interrupted the agent mid-sentence! Acknowledge their interruption politely ("Oh go right ahead—I hear you...") before pivoting.' : 'No, normal turn-taking.'}
-
-LOCKED CALCULATOR NUMBERS (NEVER INVENT OTHER NUMBERS):
-- Opening Cash Offer: ${openStr}
-- Target / Max Cash Offer (MAO): ${targetStr}
-- Walk-Away Ceiling: ${walkStr}
-- Repair Estimate: ${repStr}
-
-Recent Call Context:
-${recentTurns || 'Call just started.'}
-
-The Seller on the phone JUST said: "${cleanedSellerText}"
-
-TASK:
-Write the EXACT next 1 to 2 spoken sentences the Agent should say back right now, matching the Agent's personal tone (${agentVoiceProfileRef.current?.toneStyle}) and de-escalating the Seller's tone (${sellerTone.label}).
-- Output ONLY the raw spoken words (no quotes, no labels, no markdown).
-- Language: ${speechLang === 'ar-EG' ? 'Natural Egyptian Arabic' : 'Natural conversational English'}.`;
-
-    const modelToUse = apiKey ? selectedModel || 'gemini-3-flash-preview' : 'gemini-3-flash-preview';
-    const effectiveKey = apiKey || '';
-
     try {
       const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${modelToUse}:generateContent?key=${effectiveKey}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/${selectedModel || 'gemini-3-flash-preview'}:generateContent?key=${apiKey}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { temperature: 0.3 }
+            contents: [
+              {
+                parts: [
+                  {
+                    text: buildGeminiPrompt({
+                      sellerSpeech: text,
+                      ctx,
+                      lang,
+                      wasBargeIn,
+                      toneLabel: sellerTone.label,
+                      turn: callLog.length + 1,
+                      history: callLog
+                    })
+                  }
+                ]
+              }
+            ],
+            generationConfig: { temperature: 0.35 }
           })
         }
       );
-      if (res.ok) {
-        const data = await res.json();
-        const rawReply = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-        const cleanReply = rawReply.replace(/^["'“”]+|["'“”]+$/g, '').trim();
 
-        if (cleanReply && cleanReply.length > 8) {
-          setAiSuggestion(cleanReply);
-          setAiSourceBadge(wasBargeIn ? '✨ Gemini Barge-In AI' : '✨ Gemini Tone-Matched AI');
-          expectedUserScriptRef.current = cleanReply;
+      if (!res.ok) throw new Error(`Gemini ${res.status}`);
 
-          setCallLog((prev) => [
-            ...prev,
-            {
-              role: 'seller',
-              text: cleanedSellerText,
-              tone: sellerTone.label,
-              wasBargeIn,
-              time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-            },
-            {
-              role: 'copilot',
-              text: cleanReply,
-              time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-            }
-          ]);
+      const data = await res.json();
+      const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      const guarded = guardModelOutput(raw, ctx);
 
-          if (onAppendToConversation) {
-            onAppendToConversation(
-              `Seller (${wasBargeIn ? 'Interrupted' : 'Live'} - ${sellerTone.id}): ${cleanedSellerText}\nMe (Co-Pilot): ${cleanReply}`
-            );
-          }
-          setIsAiThinking(false);
-          return;
+      if (guarded) {
+        setAiSuggestion(guarded);
+        expectedUserScriptRef.current = guarded;
+        setAiSourceBadge('✨ Gemini + سياق الصفقة');
+        setCallLog((prev) =>
+          prev.map((turn) => (turn.id === copilotId ? { ...turn, text: guarded, source: 'gemini' } : turn))
+        );
+        if (appendToDeal && onAppendToConversation) {
+          onAppendToConversation(`Me (co-pilot, AI): ${guarded}`);
         }
+      } else {
+        setAiError('تم تجاهل رد الـ AI لأنه يحتوي رقماً غير موجود في حاسبة الصفقة — تم استخدام الرد السياقي المحلي.');
       }
     } catch {
-      // Fallback to instantLocalReply
+      setAiError('تعذر الاتصال بموديل الـ AI — تم استخدام الرد السياقي المحلي.');
+    } finally {
+      setIsAiThinking(false);
     }
-
-    setCallLog((prev) => [
-      ...prev,
-      {
-        role: 'seller',
-        text: cleanedSellerText,
-        tone: sellerTone.label,
-        wasBargeIn,
-        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-      },
-      {
-        role: 'copilot',
-        text: instantLocalReply,
-        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-      }
-    ]);
-    if (onAppendToConversation) {
-      onAppendToConversation(
-        `Seller (${wasBargeIn ? 'Interrupted' : 'Live'} - ${sellerTone.id}): ${cleanedSellerText}\nMe (Co-Pilot): ${instantLocalReply}`
-      );
-    }
-    setIsAiThinking(false);
   };
 
-  const processCapturedSpeech = (spokenText, isInterimCheck = false) => {
-    const trimmed = (spokenText || '').trim();
-    if (trimmed.length < 3) return { action: 'noop' };
+  const processCapturedSpeech = (spokenText) => {
+    const trimmed = String(spokenText || '').trim();
+    if (trimmed.length < 2) return;
 
     if (muteMyVoiceRef.current) {
-      if (!isInterimCheck) {
-        autoUpdateAgentVoiceprint();
-        setLastIgnoredUserText(`(Muted My Voice) "${trimmed}"`);
-        setLiveText('');
-        unspokenBufferRef.current = '';
-      }
-      return { action: 'ignored_agent' };
+      autoUpdateAgentVoiceprint();
+      setLastIgnoredUserText(`🔇 (Muted) "${trimmed.slice(0, 70)}"`);
+      setLiveText('');
+      unspokenBufferRef.current = '';
+      return;
     }
 
     if (listenMode === 'handsfree') {
-      const progressAnalysis = analyzeScriptProgressAndBargeIn(trimmed, expectedUserScriptRef.current);
-
-      if (progressAnalysis.hasBargeInTail && progressAnalysis.bargeInText.trim().length >= 3) {
-        setLastIgnoredUserText(`قرأت: "${progressAnalysis.agentPrefixText.slice(0, 45)}..." ثم قاطعك البايع!`);
-        getAiResponseForSeller(progressAnalysis.bargeInText, { wasBargeIn: true });
-        return { action: 'barge_in' };
-      }
+      const progress = analyzeScriptProgressAndBargeIn(trimmed, expectedUserScriptRef.current);
+      const intentInfo = detectSellerIntent(trimmed);
 
       let maxSim = 0;
-      for (const candidateScript of allKnownUserScripts) {
-        const sim = calculateScriptSimilarity(trimmed, candidateScript);
+      for (const candidate of allKnownUserScripts) {
+        const sim = calculateScriptSimilarity(trimmed, candidate);
         if (sim > maxSim) maxSim = sim;
       }
 
       const voiceMatch = compareWithAgentVoiceProfile(liveAcousticRef.current, agentVoiceProfileRef.current);
-      const isAgentSpeaking =
-        progressAnalysis.isPrefixOfScript ||
-        maxSim >= similarityThreshold ||
-        isClearlyAgentSelfIntroOrPitch(trimmed) ||
-        (voiceMatch.isKnownAgentVoice && maxSim >= 0.3);
+
+      const looksLikeAgent =
+        (progress.isPrefixOfScript && progress.progressRatio >= 0.3) ||
+        maxSim >= Math.max(0.7, similarityThreshold) ||
+        isClearlyAgentSelfIntroOrPitch(trimmed);
+
+      // A clear seller intent (price, timeline, repairs, family, payoff...) wins
+      // unless the utterance is a near-exact match to the agent's own script.
+      const strongSellerIntent = intentInfo.matched && intentInfo.id !== 'greeting' && intentInfo.id !== 'question';
+      const isAgentSpeaking = looksLikeAgent && !(strongSellerIntent && maxSim < 0.8);
 
       if (isAgentSpeaking) {
-        const pct = Math.round(Math.max(progressAnalysis.progressRatio, maxSim) * 100);
+        lastAgentSpeechAtRef.current = Date.now();
         autoUpdateAgentVoiceprint();
-
-        if (progressAnalysis.isPrefixOfScript && progressAnalysis.progressRatio < 0.8) {
-          setTurnStatusBadge({
-            type: 'agent_paused',
-            label: `⏸️ توقف مؤقت منك (قرأت ${pct}% من السكريبت) — كمل كلامك براحتك أو لو البايع قاطعك هيلقطه فوراً`,
-            scriptProgressPct: pct
-          });
-          return { action: 'agent_paused_mid_script', pct };
-        }
-
-        if (!isInterimCheck) {
-          setTurnStatusBadge({
-            type: 'agent_reading',
-            label: `✅ أنهيت قراءة السكريبت (${pct}% تطابق + تم تحديث بصمة صوتك) — بانتظار رد البايع...`,
-            scriptProgressPct: 100
-          });
-          setLastIgnoredUserText(
-            `"${trimmed.slice(0, 60)}..." (${pct}% تطابق السكريبت • بصمة صوتك ${voiceMatch.matchConfidence || 88}%)`
-          );
-          setLiveText('');
-          unspokenBufferRef.current = '';
-        }
-        return { action: 'ignored_agent' };
+        const pct = Math.round(Math.max(progress.progressRatio, maxSim) * 100);
+        setTurnStatusBadge({
+          type: 'agent_reading',
+          label: `✅ صوتك أنت (${pct}% تطابق السكريبت) — مستمع لرد البايع الآن`,
+          scriptProgressPct: pct
+        });
+        setLastIgnoredUserText(
+          `"${trimmed.slice(0, 60)}..." (${pct}% تطابق • بصمة الصوت ${voiceMatch.matchConfidence || 0}%)`
+        );
+        setLiveText('');
+        unspokenBufferRef.current = '';
+        return;
       }
     }
 
-    if (!isInterimCheck) {
-      const wasAgentMidScript = turnStatusBadge.type === 'agent_paused';
-      getAiResponseForSeller(trimmed, { wasBargeIn: wasAgentMidScript });
+    const bargeIn =
+      CUE_REGEX.test(trimmed) && Date.now() - lastAgentSpeechAtRef.current < 9000;
+
+    replyToSeller(trimmed, { wasBargeIn: bargeIn });
+  };
+
+  // -------------------------------------------------------------------------
+  // Speech engine — final results drive replies; interim only drives display
+  // -------------------------------------------------------------------------
+  const stopSpeechEngine = () => {
+    isListeningRef.current = false;
+    setIsListening(false);
+    stopAcousticAnalyzer();
+    if (pendingUtteranceRef.current) clearTimeout(pendingUtteranceRef.current);
+    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch {
+        // ignore
+      }
     }
-    return { action: 'seller_turn' };
+    setCallEndedAt((prev) => prev || Date.now());
   };
 
   const startSpeechEngine = () => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) {
-      setAiSuggestion(
-        'Browser Speech Recognition requires Google Chrome or Edge. You can also test live responses using the input box or 1-Tap buttons below!'
-      );
+      setAiError('التعرف على الصوت يحتاج Google Chrome أو Microsoft Edge. يمكنك التجربة بكتابة كلام البايع في الأسفل.');
       return;
     }
 
@@ -572,7 +616,6 @@ Write the EXACT next 1 to 2 spoken sentences the Agent should say back right now
       }
     }
 
-    processedCharsCountRef.current = 0;
     unspokenBufferRef.current = '';
 
     const recognition = new SpeechRecognition();
@@ -581,58 +624,38 @@ Write the EXACT next 1 to 2 spoken sentences the Agent should say back right now
     recognition.lang = speechLang;
 
     recognition.onresult = (event) => {
-      let fullSessionTranscript = '';
-      for (let i = 0; i < event.results.length; ++i) {
-        fullSessionTranscript += event.results[i][0].transcript + ' ';
+      let interim = '';
+      let finals = '';
+      for (let i = event.resultIndex; i < event.results.length; i += 1) {
+        const result = event.results[i];
+        const transcript = result[0]?.transcript || '';
+        if (result.isFinal) finals += `${transcript} `;
+        else interim += transcript;
       }
 
-      const freshSlice = fullSessionTranscript.slice(processedCharsCountRef.current).trim();
-      if (!freshSlice) return;
+      const display = (finals || interim).trim();
+      if (display) setLiveText(display);
 
-      setLiveText(freshSlice);
-      unspokenBufferRef.current = freshSlice;
-
-      if (listenMode === 'handsfree') {
-        const liveProgress = analyzeScriptProgressAndBargeIn(freshSlice, expectedUserScriptRef.current);
-
-        if (liveProgress.hasBargeInTail && liveProgress.bargeInText.split(/\s+/).length >= 3) {
-          if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-          processedCharsCountRef.current = fullSessionTranscript.length;
-          processCapturedSpeech(freshSlice, false);
-          return;
-        }
-
-        if (liveProgress.isPrefixOfScript) {
-          const pct = Math.round(liveProgress.progressRatio * 100);
+      if (interim.trim()) {
+        unspokenBufferRef.current = interim.trim();
+        if (CUE_REGEX.test(interim) && Date.now() - lastAgentSpeechAtRef.current < 9000) {
           setTurnStatusBadge({
-            type: 'agent_reading',
-            label: `🎤 أنت تقرأ السكريبت الآن (${pct}% مكتمل) — لو سكتت في النص هينتظرك، ولو البايع قاطعك هيرد فوراً`,
-            scriptProgressPct: pct
+            type: 'seller_barge_in',
+            label: '⚡ يبدو أن البايع قاطعك — جارٍ تجهيز الرد…',
+            scriptProgressPct: 0
           });
         }
+      }
 
-        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-
-        const effectiveWaitMs =
-          liveProgress.isPrefixOfScript && liveProgress.progressRatio < 0.8
-            ? Math.round(silenceDelayMs * 1.85)
-            : silenceDelayMs;
-
-        silenceTimerRef.current = setTimeout(() => {
-          const textToProcess = unspokenBufferRef.current.trim();
-          if (textToProcess.length >= 3) {
-            const result = processCapturedSpeech(textToProcess, false);
-            if (result?.action !== 'agent_paused_mid_script') {
-              processedCharsCountRef.current = fullSessionTranscript.length;
-            }
-          }
-        }, effectiveWaitMs);
+      if (finals.trim()) {
+        const text = finals.trim();
+        if (pendingUtteranceRef.current) clearTimeout(pendingUtteranceRef.current);
+        pendingUtteranceRef.current = setTimeout(() => processCapturedSpeech(text), 280);
       }
     };
 
     recognition.onend = () => {
       if (isListeningRef.current && listenMode === 'handsfree') {
-        processedCharsCountRef.current = 0;
         try {
           recognition.start();
         } catch {
@@ -658,20 +681,56 @@ Write the EXACT next 1 to 2 spoken sentences the Agent should say back right now
     }
   };
 
-  const stopSpeechEngine = () => {
-    isListeningRef.current = false;
-    setIsListening(false);
-    stopAcousticAnalyzer();
-    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch {
-        // ignore
-      }
+  // -------------------------------------------------------------------------
+  // Sessions — every call is independent; each deal is isolated by App key
+  // -------------------------------------------------------------------------
+  const beginNewCall = ({ autoListen = false } = {}) => {
+    stopSpeechEngine();
+    setCallEndedAt(null);
+    setCallLog([]);
+    setLastSellerText('');
+    setLastIntent(null);
+    setLiveText('');
+    setLastIgnoredUserText('');
+    setLiveCustomOffer(null);
+    setAiError('');
+    setDetectedSellerTone(NEUTRAL_TONE);
+    setTurnStatusBadge({
+      type: 'ready',
+      label: '🎧 مكالمة جديدة — سياق نظيف لهذه الصفقة فقط (لا كلام من مكالمات سابقة)',
+      scriptProgressPct: 0
+    });
+
+    const nextCallNumber = callNumber + 1;
+    setCallNumber(nextCallNumber);
+    const rotatedOpener = generateCallOpener(ctx, lang);
+    const opener =
+      nextCallNumber % 2 === 0 && scriptPackage?.opening
+        ? scriptPackage.opening
+        : rotatedOpener;
+    setAiSuggestion(opener);
+    expectedUserScriptRef.current = opener;
+    setAiSourceBadge('جاهز');
+    setCallStartedAt(Date.now());
+    lastAgentSpeechAtRef.current = 0;
+    lastUtteranceRef.current = { text: '', at: 0 };
+
+    if (autoListen) {
+      setTimeout(() => startSpeechEngine(), 80);
     }
-    if (listenMode === 'ptt' && unspokenBufferRef.current.trim().length > 2) {
-      processCapturedSpeech(unspokenBufferRef.current, false);
+  };
+
+  const toggleListening = () => {
+    if (isListening) {
+      stopSpeechEngine();
+      setTurnStatusBadge({
+        type: 'ready',
+        label: '⏹ تم إيقاف الاستماع — التفريغ محفوظ لهذه المكالمة فقط. اضغط «مكالمة جديدة» للبدء من جديد.',
+        scriptProgressPct: 0
+      });
+    } else {
+      if (!callStartedAt) beginNewCall({ autoListen: true });
+      else startSpeechEngine();
     }
   };
 
@@ -679,6 +738,7 @@ Write the EXACT next 1 to 2 spoken sentences the Agent should say back right now
     return () => {
       isListeningRef.current = false;
       stopAcousticAnalyzer();
+      if (pendingUtteranceRef.current) clearTimeout(pendingUtteranceRef.current);
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
       if (recognitionRef.current) {
         try {
@@ -691,17 +751,28 @@ Write the EXACT next 1 to 2 spoken sentences the Agent should say back right now
   }, []);
 
   const triggerPanicDeescalate = () => {
-    const targetStr = math.isComplete ? formatUSD(liveCustomOffer || math.target) : 'our cash figure';
-    const calmLine = `I hear you 100%, and please know I am not here to pressure you or waste a second of your time. If ${targetStr} cash doesn't work for what you need right now, we can part as friends and I can simply leave the written net breakdown with you as a backup option—fair enough?`;
+    const targetStr = math.isComplete ? formatUSD(liveCustomOffer || math.target) : 'الرقم اللي أقدر أوصله';
+    const calmLine =
+      lang === 'ar'
+        ? `فاهمك 100%، ومش هنا أضغط عليك ولا أضيع وقتك. لو ${targetStr} مش مناسب للي محتاجه، نفترق كأصحاب وأسيبلك التفاصيل مكتوبة كخيار احتياطي — تمام؟`
+        : `I hear you 100%, and I am not here to pressure you or waste your time. If ${targetStr} cash does not work for what you need, we can part as friends and I will leave the breakdown as a backup option — fair enough?`;
     setAiSuggestion(calmLine);
     expectedUserScriptRef.current = calmLine;
-    setAiSourceBadge('🧯 De-Escalation Rescue');
+    setAiSourceBadge('🧯 تهدئة');
+    pushTurn({ role: 'copilot', text: calmLine, source: 'panic' });
     setTurnStatusBadge({
       type: 'seller_barge_in',
-      label: '🧯 تم تفعيل جملة تهدئة البايع وإنقاذ المكالمة فوراً',
+      label: '🧯 تم تفعيل جملة تهدئة البايع',
       scriptProgressPct: 0
     });
   };
+
+  const elapsedMs = callStartedAt ? (callEndedAt || clockNow) - callStartedAt : 0;
+  const intensityLabel = isListening
+    ? '● يستمع الآن'
+    : callStartedAt
+    ? '⏹ المكالمة متوقفة'
+    : 'جاهز لمكالمة جديدة';
 
   const cardTheme = isLight
     ? 'bg-white border-slate-200 text-slate-900 shadow-lg'
@@ -712,59 +783,50 @@ Write the EXACT next 1 to 2 spoken sentences the Agent should say back right now
 
   return (
     <section className={`border-2 rounded-2xl p-4 sm:p-6 space-y-5 ${cardTheme}`}>
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-500/20 pb-4">
+      {/* Header */}
+      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-500/20 pb-4">
         <div>
           <div className="flex flex-wrap items-center gap-2">
             <span className="inline-flex items-center justify-center w-8 h-8 rounded-xl bg-emerald-500/15 border border-emerald-500/40 text-emerald-500">
               <Mic className={`w-4 h-4 ${isListening ? 'text-rose-500 animate-pulse' : 'text-emerald-500'}`} />
             </span>
-            <h2 className="text-base sm:text-lg font-extrabold">
-              Live Call Whisperer Co-Pilot 🎧
-            </h2>
+            <h2 className="text-base sm:text-lg font-extrabold">Live Call Whisperer Co-Pilot 🎧</h2>
             <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-500/15 text-emerald-500 border border-emerald-500/30">
               {aiSourceBadge}
             </span>
+            <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-sky-500/15 text-sky-400 border border-sky-500/30">
+              🔒 سياق هذه الصفقة فقط
+            </span>
           </div>
           <p className={`text-xs mt-1 ${isLight ? 'text-slate-500' : 'text-zinc-400'}`}>
-            يميز ذكياً بين <strong>توقفك المؤقت (Pause)</strong> و<strong>مقاطعة البايع (Barge-In)</strong> + يحفظ بصمة ونبرة صوتك ويكتشف نبرة البايع لحظياً.
+            كل مكالمة تبدأ نظيفة، والردود تُبنى على كلام البايع + بيانات هذه الصفقة (بدون أرقام أو وقائع محفوظة من مكالمة أخرى).
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <div className={`inline-flex rounded-xl p-1 border ${isLight ? 'bg-slate-100 border-slate-300' : 'bg-zinc-950 border-zinc-800'}`}>
-            <button
-              type="button"
-              onClick={() => {
-                stopSpeechEngine();
-                setListenMode('handsfree');
-              }}
-              className={`px-3 py-1 rounded-lg text-xs font-bold transition ${
-                listenMode === 'handsfree'
-                  ? 'bg-emerald-500 text-slate-950'
-                  : isLight
-                  ? 'text-slate-600'
-                  : 'text-zinc-400'
-              }`}
-            >
-              Hands-Free (Smart Pause/Barge-In)
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                stopSpeechEngine();
-                setListenMode('ptt');
-              }}
-              className={`px-3 py-1 rounded-lg text-xs font-bold transition ${
-                listenMode === 'ptt'
-                  ? 'bg-emerald-500 text-slate-950'
-                  : isLight
-                  ? 'text-slate-600'
-                  : 'text-zinc-400'
-              }`}
-            >
-              Push-to-Talk
-            </button>
+          <div
+            className={`px-3 py-1.5 rounded-xl border text-[11px] font-bold flex items-center gap-2 ${
+              isLight ? 'bg-slate-50 border-slate-300' : 'bg-zinc-950 border-zinc-800'
+            }`}
+          >
+            <PhoneCall className="w-3.5 h-3.5 text-emerald-500" />
+            مكالمة #{callNumber || 0}
+            <span className="font-mono">{formatDuration(elapsedMs)}</span>
+            <span className={isListening ? 'text-rose-400' : 'opacity-70'}>{intensityLabel}</span>
           </div>
+
+          <button
+            type="button"
+            onClick={() => beginNewCall({ autoListen: false })}
+            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[11px] font-extrabold border transition ${
+              isLight
+                ? 'bg-white border-slate-300 text-slate-700 hover:bg-slate-100'
+                : 'bg-zinc-900 border-zinc-700 text-zinc-200 hover:bg-zinc-800'
+            }`}
+            title="كل مكالمة تبدأ بسياق نظيف منفصل عن المكالمة السابقة"
+          >
+            <RotateCcw className="w-3.5 h-3.5" /> مكالمة جديدة (New Call)
+          </button>
 
           <button
             type="button"
@@ -778,38 +840,75 @@ Write the EXACT next 1 to 2 spoken sentences the Agent should say back right now
         </div>
       </div>
 
-      {/* VOICEPRINT BIOMETRICS, PERSONAL TONE SAVER & SELLER TONE DETECTOR BAR */}
+      {/* Deal context the co-pilot is allowed to use */}
+      <div className={`rounded-xl p-3 border ${subBoxTheme}`}>
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+          <span className="text-[11px] font-extrabold uppercase tracking-wider text-emerald-500 flex items-center gap-1.5">
+            <Brain className="w-3.5 h-3.5" /> حقائق الصفقة التي يستخدمها الـ Co-Pilot
+          </span>
+          <span className="text-[10px] opacity-60">لا يستخدم أي معلومة خارج هذه القائمة</span>
+        </div>
+        <div className="flex flex-wrap gap-1.5">
+          {contextFacts.map((fact) => (
+            <span
+              key={fact.label}
+              className={`px-2 py-0.5 rounded-md text-[10px] font-semibold border ${
+                isLight ? 'bg-white border-slate-200' : 'bg-zinc-900 border-zinc-800'
+              }`}
+            >
+              <span className="opacity-60">{fact.label}:</span> <span className="font-mono">{fact.value}</span>
+            </span>
+          ))}
+          {ctx.timelineSentence && (
+            <span className="px-2 py-0.5 rounded-md text-[10px] font-semibold border border-amber-500/30 bg-amber-500/10 text-amber-500">
+              تایم لاين: {ctx.timelineSentence.slice(0, 60)}
+            </span>
+          )}
+          {ctx.occupancy !== 'unknown' && (
+            <span className="px-2 py-0.5 rounded-md text-[10px] font-semibold border border-sky-500/30 bg-sky-500/10 text-sky-400">
+              الإشغال: {ctx.occupancy}
+            </span>
+          )}
+          {ctx.payoff && (
+            <span className="px-2 py-0.5 rounded-md text-[10px] font-semibold border border-rose-500/30 bg-rose-500/10 text-rose-400">
+              Payoff: {formatUSD(ctx.payoff)}
+            </span>
+          )}
+        </div>
+        <p className={`text-[10px] mt-2 ${isLight ? 'text-slate-500' : 'text-zinc-500'}`}>
+          لكل صفقة سياقها المستقل: عند فتح صفقة أخرى يبدأ الـ Co-Pilot من الصفر. مكالمة جديدة = سجل ومقترحات جديدة.
+        </p>
+      </div>
+
+      {/* Voiceprint + tone strip */}
       <div className={`rounded-xl p-3.5 border grid grid-cols-1 lg:grid-cols-12 gap-3 items-center ${subBoxTheme}`}>
-        <div className="lg:col-span-5 flex flex-wrap items-center justify-between gap-2 border-b lg:border-b-0 lg:border-r border-slate-500/20 pb-2 lg:pb-0 lg:pr-3">
+        <div className="lg:col-span-5 flex flex-wrap items-center justify-between gap-2 border-b lg:border-b-0 lg:border-r border-slate-500/20 pb-2 lg:pb-0 lg:pl-3">
           <div>
             <div className="flex items-center gap-1.5">
               <span className="text-[11px] font-extrabold text-emerald-500 uppercase tracking-wider">
-                🎙️ بصمة ونبرة صوتك المحفوظة:
+                🎙️ بصمة صوتك:
               </span>
               {agentVoiceProfile.calibrated && (
                 <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-emerald-500/20 text-emerald-400">
-                  ✓ محفوظة ({agentVoiceProfile.avgPitchHz} Hz)
+                  ✓ {agentVoiceProfile.avgPitchHz} Hz
                 </span>
               )}
             </div>
-            <div className="flex items-center gap-2 mt-1">
-              <select
-                value={agentVoiceProfile.toneStyle}
-                onChange={(e) =>
-                  setAgentVoiceProfile((prev) => ({ ...prev, toneStyle: e.target.value, calibrated: true }))
-                }
-                className={`border rounded-lg px-2 py-1 text-[11px] font-semibold ${
-                  isLight ? 'bg-white border-slate-300 text-slate-800' : 'bg-zinc-900 border-zinc-700 text-zinc-200'
-                }`}
-              >
-                <option value="Calm, Consultative & Empathetic">هادئ، استشاري ومتعاطف (Calm & Consultative)</option>
-                <option value="Energetic, Direct & Confident">واثق، مباشر وسريع (Direct & Confident)</option>
-                <option value="Warm, Empathetic & Conversational">ودود، دافئ ومطمئن (Warm & Friendly)</option>
-                <option value="Analytical & Math-Focused">تحليلي ومبني على الأرقام (Math-Driven)</option>
-              </select>
-            </div>
+            <select
+              value={agentVoiceProfile.toneStyle}
+              onChange={(e) =>
+                setAgentVoiceProfile((prev) => ({ ...prev, toneStyle: e.target.value, calibrated: true }))
+              }
+              className={`mt-1 border rounded-lg px-2 py-1 text-[11px] font-semibold ${
+                isLight ? 'bg-white border-slate-300 text-slate-800' : 'bg-zinc-900 border-zinc-700 text-zinc-200'
+              }`}
+            >
+              <option value="Calm, Consultative & Empathetic">هادئ، استشاري ومتعاطف</option>
+              <option value="Energetic, Direct & Confident">واثق ومباشر</option>
+              <option value="Warm, Empathetic & Conversational">ودود ومطمئن</option>
+              <option value="Analytical & Math-Focused">تحليلي بالأرقام</option>
+            </select>
           </div>
-
           <button
             type="button"
             onClick={calibrateMyVoiceProfile}
@@ -820,36 +919,28 @@ Write the EXACT next 1 to 2 spoken sentences the Agent should say back right now
                 : 'bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-400 border border-emerald-500/40'
             }`}
           >
-            {isCalibratingVoice ? '🎙️ تكلم الآن لمدة 3 ثواني...' : '🎙️ معايرة وحفظ صوتي'}
+            {isCalibratingVoice ? '🎙️ تكلم 3 ثواني…' : '🎙️ معايرة صوتي'}
           </button>
         </div>
 
-        <div className="lg:col-span-3 flex flex-col justify-center border-b lg:border-b-0 lg:border-r border-slate-500/20 pb-2 lg:pb-0 lg:pr-3 text-xs">
+        <div className="lg:col-span-3 flex flex-col justify-center border-b lg:border-b-0 lg:border-r border-slate-500/20 pb-2 lg:pb-0 lg:pl-3 text-xs">
           <div className="flex items-center justify-between">
-            <span className="opacity-70 text-[11px]">التردد الحي (Pitch):</span>
+            <span className="opacity-70 text-[11px]">Pitch:</span>
             <span className="font-mono font-bold text-sky-400">
               {liveAcoustic.pitchHz > 0 ? `${liveAcoustic.pitchHz} Hz` : '—'}
             </span>
           </div>
           <div className="flex items-center justify-between mt-1">
-            <span className="opacity-70 text-[11px]">تطابق بصمة صوتك:</span>
-            <span
-              className={`font-mono font-bold ${
-                liveAcoustic.voiceMatchPct >= 70 ? 'text-emerald-400' : 'text-amber-400'
-              }`}
-            >
-              {liveAcoustic.pitchHz > 0
-                ? liveAcoustic.voiceMatchPct >= 70
-                  ? `${liveAcoustic.voiceMatchPct}% (صوتك أنت)`
-                  : `${liveAcoustic.voiceMatchPct}% (نبرة البايع)`
-                : 'بانتظار الصوت'}
+            <span className="opacity-70 text-[11px]">تطابق صوتك:</span>
+            <span className={`font-mono font-bold ${liveAcoustic.voiceMatchPct >= 70 ? 'text-emerald-400' : 'text-amber-400'}`}>
+              {liveAcoustic.pitchHz > 0 ? `${liveAcoustic.voiceMatchPct}%` : 'بانتظار الصوت'}
             </span>
           </div>
         </div>
 
         <div className="lg:col-span-4 flex flex-col justify-center">
           <div className="flex items-center justify-between gap-2">
-            <span className="text-[11px] font-bold opacity-75">نبرة البايع المكتشفة:</span>
+            <span className="text-[11px] font-bold opacity-75">نبرة البايع:</span>
             <span className={`px-2 py-0.5 rounded-lg text-[11px] font-extrabold border ${detectedSellerTone.color}`}>
               {detectedSellerTone.label}
             </span>
@@ -860,7 +951,7 @@ Write the EXACT next 1 to 2 spoken sentences the Agent should say back right now
         </div>
       </div>
 
-      {/* LIVE TURN STATE BANNER: PAUSE VS. BARGE-IN INDICATOR */}
+      {/* Turn status */}
       <div
         className={`rounded-xl px-4 py-2.5 border flex flex-wrap items-center justify-between gap-2 text-xs font-bold transition-all ${
           turnStatusBadge.type === 'seller_barge_in'
@@ -874,146 +965,130 @@ Write the EXACT next 1 to 2 spoken sentences the Agent should say back right now
             : 'bg-zinc-950 border-zinc-800 text-zinc-300'
         }`}
       >
-        <div className="flex items-center gap-2">
-          <span>{turnStatusBadge.label}</span>
-        </div>
-        {turnStatusBadge.scriptProgressPct > 0 && (
-          <div className="flex items-center gap-2">
-            <span className="text-[11px] font-mono">تقدم قراءة السكريبت: {turnStatusBadge.scriptProgressPct}%</span>
-            <div className="w-24 h-2 bg-slate-700 rounded-full overflow-hidden">
-              <div
-                className="h-full bg-emerald-400 transition-all duration-200"
-                style={{ width: `${turnStatusBadge.scriptProgressPct}%` }}
-              />
-            </div>
-          </div>
+        <span>{turnStatusBadge.label}</span>
+        {lastIntent && (
+          <span className="px-2 py-0.5 rounded-md text-[10px] font-extrabold bg-sky-500/15 text-sky-400 border border-sky-500/30">
+            نية البايع: {INTENT_LABELS[lastIntent]?.ar || lastIntent}
+          </span>
         )}
       </div>
 
-      {/* Main Controls Strip */}
+      {/* Controls */}
       <div className={`flex flex-wrap items-center justify-between gap-3 rounded-xl p-3.5 border ${subBoxTheme}`}>
-        <div className="flex flex-wrap items-center gap-2.5">
-          {listenMode === 'handsfree' ? (
-            <>
-              <button
-                type="button"
-                onClick={() => (isListening ? stopSpeechEngine() : startSpeechEngine())}
-                className={`inline-flex items-center gap-2 px-5 py-2.5 rounded-xl font-extrabold text-xs sm:text-sm transition shadow-md ${
-                  isListening
-                    ? 'bg-rose-500 text-white animate-pulse'
-                    : 'bg-emerald-500 hover:bg-emerald-400 text-slate-950'
-                }`}
-                title="بدء الاستماع الحي بدون زراير — Start Hands-Free"
-              >
-                {isListening ? (
-                  <>
-                    <Square className="w-4 h-4" /> ⏹ إيقاف الاستماع (Stop Live Mic)
-                  </>
-                ) : (
-                  <>
-                    <Play className="w-4 h-4" /> 🎧 بدء الاستماع الحي بدون زراير (Start Hands-Free)
-                  </>
-                )}
-              </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={toggleListening}
+            className={`inline-flex items-center gap-2 px-5 py-2.5 rounded-xl font-extrabold text-xs sm:text-sm transition shadow-md ${
+              isListening ? 'bg-rose-500 text-white animate-pulse' : 'bg-emerald-500 hover:bg-emerald-400 text-slate-950'
+            }`}
+          >
+            {isListening ? (
+              <>
+                <Square className="w-4 h-4" /> ⏹ إيقاف الاستماع
+              </>
+            ) : (
+              <>
+                <Play className="w-4 h-4" /> 🎧 بدء الاستماع الحي (Hands-Free)
+              </>
+            )}
+          </button>
 
-              {isListening && (
-                <button
-                  type="button"
-                  onClick={() => setMuteMyVoice((m) => !m)}
-                  className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold border transition ${
-                    muteMyVoice
-                      ? 'bg-amber-500 text-slate-950 border-amber-400'
-                      : isLight
-                      ? 'bg-white border-slate-300 text-slate-700'
-                      : 'bg-zinc-900 border-zinc-700 text-zinc-300'
-                  }`}
-                >
-                  <VolumeX className="w-3.5 h-3.5" />
-                  {muteMyVoice ? '🔇 Muted (I am talking)' : '🎙️ Mute While I Talk'}
-                </button>
-              )}
-
-              {liveText && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-                    const t = unspokenBufferRef.current || liveText;
-                    unspokenBufferRef.current = '';
-                    getAiResponseForSeller(t, { wasBargeIn: true });
-                  }}
-                  className="px-3 py-2 rounded-xl text-xs font-extrabold bg-rose-500 text-white hover:bg-rose-400 transition"
-                >
-                  ⚡ ده مقاطعة من البايع (رد فوراً)
-                </button>
-              )}
-            </>
-          ) : (
+          {isListening && (
             <button
               type="button"
-              onMouseDown={startSpeechEngine}
-              onMouseUp={stopSpeechEngine}
-              onTouchStart={startSpeechEngine}
-              onTouchEnd={stopSpeechEngine}
-              className={`px-6 py-3 rounded-xl font-extrabold text-sm transition shadow-lg ${
-                isListening ? 'bg-rose-500 text-white scale-105' : 'bg-emerald-500 text-slate-950'
+              onClick={() => setMuteMyVoice((m) => !m)}
+              className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold border transition ${
+                muteMyVoice
+                  ? 'bg-amber-500 text-slate-950 border-amber-400'
+                  : isLight
+                  ? 'bg-white border-slate-300 text-slate-700'
+                  : 'bg-zinc-900 border-zinc-700 text-zinc-300'
               }`}
             >
-              {isListening ? '🎙️ Listening to Seller... (Release for Instant Reply)' : '🎙️ Hold While Seller Speaks'}
+              <VolumeX className="w-3.5 h-3.5" />
+              {muteMyVoice ? '🔇 Muted (أنا بتكلم)' : '🎙️ Mute While I Talk'}
+            </button>
+          )}
+
+          {liveText && (
+            <button
+              type="button"
+              onClick={() => {
+                const text = unspokenBufferRef.current || liveText;
+                unspokenBufferRef.current = '';
+                replyToSeller(text);
+              }}
+              className="px-3 py-2 rounded-xl text-xs font-extrabold bg-rose-500 text-white hover:bg-rose-400 transition"
+            >
+              ⚡ ده كلام البايع — رد فوراً
             </button>
           )}
         </div>
 
-        <div className="flex flex-wrap items-center gap-4 text-xs">
-          <div className="flex items-center gap-1.5">
-            <span className="opacity-70">Pause Timer:</span>
+        <div className="flex flex-wrap items-center gap-3 text-xs">
+          <label className="flex items-center gap-1.5">
             <input
-              type="range"
-              min="500"
-              max="1800"
-              step="100"
-              value={silenceDelayMs}
-              onChange={(e) => setSilenceDelayMs(Number(e.target.value))}
-              className="w-20 accent-emerald-500"
+              type="checkbox"
+              checked={useAi}
+              onChange={(e) => setUseAi(e.target.checked)}
+              disabled={!apiKey}
+              className="accent-emerald-500"
             />
-            <span className="font-mono font-bold text-emerald-500">{(silenceDelayMs / 1000).toFixed(1)}s</span>
-          </div>
+            <span className={apiKey ? '' : 'opacity-40'}>AI (Gemini)</span>
+          </label>
+          <label className="flex items-center gap-1.5">
+            <input
+              type="checkbox"
+              checked={appendToDeal}
+              onChange={(e) => setAppendToDeal(e.target.checked)}
+              className="accent-emerald-500"
+            />
+            <span>أضف كلام المكالمة لملاحظات الصفقة</span>
+          </label>
           <div className="flex items-center gap-1.5">
-            <span className="opacity-70">Echo Filter:</span>
+            <span className="opacity-70">Echo:</span>
             <input
               type="range"
-              min="0.35"
-              max="0.80"
+              min="0.4"
+              max="0.85"
               step="0.05"
               value={similarityThreshold}
               onChange={(e) => setSimilarityThreshold(Number(e.target.value))}
-              className="w-20 accent-emerald-500"
+              className="w-16 accent-emerald-500"
             />
             <span className="font-mono font-bold text-emerald-500">{Math.round(similarityThreshold * 100)}%</span>
           </div>
         </div>
       </div>
 
-      {/* 8 One-Tap Instant Seller Objection Moments */}
+      {aiError && (
+        <div className="rounded-xl px-3 py-2 border border-amber-500/40 bg-amber-500/10 text-[11px] font-semibold text-amber-500 flex items-start gap-2">
+          <ShieldAlert className="w-4 h-4 shrink-0 mt-0.5" />
+          <span>{aiError}</span>
+        </div>
+      )}
+
+      {/* Quick prompts */}
       <div>
         <div className="flex flex-wrap items-center justify-between gap-2 mb-1.5">
           <span className="text-[11px] font-bold uppercase tracking-wider text-amber-500 flex items-center gap-1">
-            <Zap className="w-3.5 h-3.5" /> 8 أزرار اعتراضات البايع الفورية (1-Tap Seller Moments)
+            <Zap className="w-3.5 h-3.5" /> 8 أزرار اعتراضات فورية — بأرقام هذه الصفقة
           </span>
           <button
             type="button"
             onClick={triggerPanicDeescalate}
             className="px-2.5 py-1.5 rounded-lg text-xs font-extrabold bg-amber-500 text-slate-950 hover:bg-amber-400 transition"
           >
-            🧯 إنقاذ وتهدئة البايع فوراً
+            🧯 إنقاذ وتهدئة
           </button>
         </div>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
-          {QUICK_LIVE_PROMPTS.map((item, idx) => (
+          {quickPrompts.map((item, idx) => (
             <button
               key={idx}
               type="button"
-              onClick={() => getAiResponseForSeller(item.text, { wasBargeIn: item.bargeIn })}
+              onClick={() => replyToSeller(item.text, { wasBargeIn: item.bargeIn })}
               title={item.label}
               className={`px-2.5 py-2 rounded-lg text-[11px] font-semibold border transition text-left leading-snug ${
                 item.bargeIn
@@ -1024,78 +1099,81 @@ Write the EXACT next 1 to 2 spoken sentences the Agent should say back right now
               }`}
             >
               <span className="block text-[9px] font-mono opacity-60">#{idx + 1}</span>
-              {item.shortLabel || item.label}
+              {item.shortLabel}
             </button>
           ))}
         </div>
       </div>
 
-      {/* Side-by-Side Live Stream & Teleprompter */}
+      {/* Live transcript + suggestion */}
       <div className="grid grid-cols-1 md:grid-cols-12 gap-4">
-        <div className={`md:col-span-5 rounded-xl p-4 border flex flex-col justify-between min-h-[200px] ${subBoxTheme}`}>
-          <div>
-            <div className="text-xs font-bold text-sky-500 mb-2 flex items-center justify-between">
-              <span className="flex items-center gap-1.5">
-                <User className="w-4 h-4" /> Seller Live Speech & Tone
+        <div className={`md:col-span-5 rounded-xl p-4 border flex flex-col min-h-[240px] ${subBoxTheme}`}>
+          <div className="text-xs font-bold text-sky-500 mb-2 flex items-center justify-between">
+            <span className="flex items-center gap-1.5">
+              <User className="w-4 h-4" /> Seller — this call
+            </span>
+            {isListening && (
+              <span className="text-[10px] px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-500 border border-rose-500/40 font-extrabold">
+                ● REC
               </span>
-              {isListening && (
-                <span className="text-[10px] px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-500 border border-rose-500/40 font-extrabold">
-                  ● REC
-                </span>
-              )}
-            </div>
+            )}
+          </div>
 
-            {liveText ? (
-              <p className="text-sm font-semibold italic p-3 rounded-lg bg-sky-500/10 border border-sky-500/30">
-                “{liveText}”
+          <div className="flex-1 text-xs space-y-1.5 max-h-40 overflow-y-auto pr-1">
+            {callLog.filter((t) => t.role === 'seller').length === 0 && (
+              <p className="text-[11px] opacity-50 text-center mt-8">
+                لم يتم تسجيل كلام من البايع في هذه المكالمة بعد. ابدأ الاستماع أو اكتب في الأسفل.
               </p>
-            ) : lastSellerText ? (
-              <div className="space-y-1.5">
-                <span className="text-[11px] opacity-60">Last captured from seller:</span>
-                <p className="text-sm font-medium italic p-3 rounded-lg bg-emerald-500/5 border border-emerald-500/20">
-                  “{lastSellerText}”
-                </p>
-              </div>
-            ) : (
-              <p className="text-xs opacity-50 mt-8 text-center">
-                Click &ldquo;Start Smart Live Listening&rdquo; or tap any Seller Moment button above...
-              </p>
+            )}
+            {callLog
+              .filter((t) => t.role === 'seller')
+              .slice(-4)
+              .map((turn) => (
+                <div key={turn.id} className="p-2 rounded-lg bg-sky-500/10 border border-sky-500/30">
+                  <div className="flex items-center justify-between gap-2 mb-0.5">
+                    <span className="text-[9px] font-mono opacity-60">{turn.time}</span>
+                    <span className="text-[9px] font-bold text-sky-400">
+                      {INTENT_LABELS[turn.intent]?.ar || turn.intent}
+                      {turn.wasBargeIn ? ' • مقاطعة' : ''}
+                    </span>
+                  </div>
+                  <p className="italic font-semibold">“{turn.text}”</p>
+                </div>
+              ))}
+            {liveText && (
+              <p className="italic text-[11px] opacity-80 border-t border-slate-500/20 pt-1">🎙️ “{liveText}”</p>
             )}
           </div>
 
           {lastIgnoredUserText && (
-            <div className="mt-3 pt-2 border-t border-slate-500/20 text-[11px] text-emerald-500 flex items-center gap-1.5">
+            <div className="mt-2 pt-2 border-t border-slate-500/20 text-[10px] text-emerald-500 flex items-center gap-1.5">
               <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
               <span className="truncate">{lastIgnoredUserText}</span>
             </div>
           )}
         </div>
 
-        <div className="md:col-span-7 rounded-xl p-4 sm:p-5 border-2 border-emerald-500 bg-emerald-950/90 text-white flex flex-col justify-between min-h-[200px] shadow-xl">
-          <div className="flex items-center justify-between mb-2">
+        <div className="md:col-span-7 rounded-xl p-4 sm:p-5 border-2 border-emerald-500 bg-emerald-950/90 text-white flex flex-col justify-between min-h-[240px] shadow-xl">
+          <div className="flex items-center justify-between mb-2 gap-2">
             <span className="text-xs font-extrabold text-emerald-300 uppercase tracking-wider flex items-center gap-1.5">
-              <Bot className="w-4 h-4" /> SAY THIS NOW (IN YOUR {agentVoiceProfile.toneStyle.split(',')[0].toUpperCase()} TONE):
+              <Bot className="w-4 h-4" /> قول ده دلوقتي (رد على كلامه)
             </span>
             <div className="flex items-center gap-2">
-              {isAiThinking && (
-                <span className="text-[10px] text-amber-300 animate-pulse font-bold">
-                  Matching Tone...
-                </span>
-              )}
+              {isAiThinking && <span className="text-[10px] text-amber-300 animate-pulse font-bold">AI…</span>}
               <span className="text-[11px] font-mono bg-emerald-400 text-slate-950 font-extrabold px-2 py-0.5 rounded">
                 MAO: {math.isComplete ? formatUSD(math.mao) : 'EST ONLY'}
               </span>
             </div>
           </div>
 
-          <blockquote className="text-lg sm:text-xl font-bold leading-relaxed bg-slate-950/85 p-4 rounded-xl border-l-4 border-emerald-400 text-white shadow-inner">
+          <blockquote className="text-base sm:text-lg font-bold leading-relaxed bg-slate-950/85 p-4 rounded-xl border-l-4 border-emerald-400 text-white shadow-inner">
             “{aiSuggestion}”
           </blockquote>
 
           {math.isComplete && math.opening && math.mao && (
             <div className="mt-3 pt-2.5 border-t border-emerald-500/30 flex flex-wrap items-center justify-between gap-2 text-xs">
               <span className="text-emerald-300 font-bold">
-                🎚️ حرك السعر لايف أثناء المكالمة: <strong className="font-mono text-white">{formatUSD(liveCustomOffer || math.opening)}</strong>
+                🎚️ عرض لايف: <strong className="font-mono text-white">{formatUSD(liveCustomOffer || math.opening)}</strong>
               </span>
               <input
                 type="range"
@@ -1106,32 +1184,57 @@ Write the EXACT next 1 to 2 spoken sentences the Agent should say back right now
                 onChange={(e) => {
                   const nextVal = Number(e.target.value);
                   setLiveCustomOffer(nextVal);
-                  const updatedLine = `If we can lock in the timeline today and take the property 100% as-is, I can bring our net cash offer to ${formatUSD(nextVal)}—with zero closing costs or fees on your end. Does ${formatUSD(nextVal)} work for you?`;
+                  const updatedLine =
+                    lang === 'ar'
+                      ? `لو نقدر نثبت التايم لاين النهاردة وناخد العقار زي ما هو، أقدر أوصل العرض الصافي لـ ${formatUSD(nextVal)} — وكل مصاريف الإغلاق علينا. يناسبك ${formatUSD(nextVal)}؟`
+                      : `If we can lock in the timeline today and take the property 100% as-is, I can bring our net cash offer to ${formatUSD(nextVal)} — with zero closing costs on your end. Does ${formatUSD(nextVal)} work for you?`;
                   setAiSuggestion(updatedLine);
                   expectedUserScriptRef.current = updatedLine;
                 }}
-                className="w-36 sm:w-48 accent-emerald-400"
+                className="w-32 sm:w-44 accent-emerald-400"
               />
-              <span className="text-[11px] font-mono text-emerald-200">
-                Spread: <strong>{formatUSD((math.arv * (math.maoPct / 100) - math.repairs) - (liveCustomOffer || math.opening))}</strong>
-              </span>
             </div>
           )}
 
-          <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-emerald-200/90 font-mono">
-            <span>Opening: <strong>{formatUSD(math.opening)}</strong></span>
-            <span>Target MAO: <strong>{formatUSD(math.target)}</strong></span>
-            <span>Walk-Away: <strong>{formatUSD(math.walkAway)}</strong></span>
+          <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-emerald-200/90 font-mono">
+            <span>Opening: {math.isComplete ? formatUSD(math.opening) : '—'}</span>
+            <span>Target: {math.isComplete ? formatUSD(math.target) : '—'}</span>
+            <span>Walk-Away: {math.isComplete ? formatUSD(math.walkAway) : '—'}</span>
           </div>
         </div>
       </div>
 
-      {/* Type Seller Reply Simulator */}
+      {/* Call transcript (agent + copilot) */}
+      {callLog.length > 0 && (
+        <div className={`rounded-xl p-3 border ${subBoxTheme}`}>
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-[11px] font-bold uppercase tracking-wider text-emerald-500">
+              سجل هذه المكالمة (منفصل عن أي مكالمة أخرى)
+            </span>
+            <span className="text-[10px] opacity-60">
+              {sessionStats.sellerTurns} رد من البايع • {sessionStats.uniqueIntents.length} نية مختلفة
+            </span>
+          </div>
+          <div className="max-h-32 overflow-y-auto space-y-1 pr-1">
+            {callLog.slice(-10).map((turn) => (
+              <div key={turn.id} className="text-[10px] leading-relaxed flex gap-1.5">
+                <span className="font-mono opacity-50 shrink-0">{turn.time}</span>
+                <span className={`font-bold shrink-0 ${turn.role === 'seller' ? 'text-sky-400' : 'text-emerald-400'}`}>
+                  {turn.role === 'seller' ? 'Seller' : 'Me'}:
+                </span>
+                <span className="opacity-90">{turn.text}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Simulator */}
       <form
         onSubmit={(e) => {
           e.preventDefault();
           if (!manualSellerInput.trim()) return;
-          getAiResponseForSeller(manualSellerInput, { wasBargeIn: false });
+          replyToSeller(manualSellerInput);
           setManualSellerInput('');
         }}
         className="flex flex-col sm:flex-row gap-2"
@@ -1140,7 +1243,7 @@ Write the EXACT next 1 to 2 spoken sentences the Agent should say back right now
           type="text"
           value={manualSellerInput}
           onChange={(e) => setManualSellerInput(e.target.value)}
-          placeholder="Type anything the seller says (or test an interruption like 'Wait hold on, $192k is too low!') and press Enter..."
+          placeholder={lang === 'ar' ? 'اكتب كلام البايع هنا لتجربة الرد…' : "Type anything the seller says and press Enter…"}
           className={`flex-1 border rounded-xl px-3.5 py-2.5 text-xs focus:outline-none focus:border-emerald-500 ${
             isLight ? 'bg-slate-50 border-slate-300 text-slate-900' : 'bg-zinc-950 border-zinc-800 text-white'
           }`}
@@ -1149,9 +1252,23 @@ Write the EXACT next 1 to 2 spoken sentences the Agent should say back right now
           type="submit"
           className="px-5 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-extrabold shrink-0 transition"
         >
-          Get Live Reply
+          جرّب الرد
         </button>
       </form>
+
+      <p className={`text-[10px] leading-relaxed ${isLight ? 'text-slate-500' : 'text-zinc-500'}`}>
+        بالاستمرار في الاستماع أو التسجيل، أنت تقر بأن لديك موافقة الأطراف اللازمة وفق قوانين ولايتك (قوانين التسجيل تختلف من
+        ولاية لأخرى). الردود والأرقام تقديرية وليست نصيحة قانونية أو ضريبية — راجع
+        <a
+          href="https://jasonwade45.github.io/Deal-analysis/#limitations"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="underline text-emerald-500 mx-1"
+        >
+          Limitations &amp; Caveats
+        </a>
+        قبل الاعتماد عليها.
+      </p>
     </section>
   );
 }
