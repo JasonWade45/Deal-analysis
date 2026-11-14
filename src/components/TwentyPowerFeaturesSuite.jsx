@@ -29,11 +29,14 @@ export default function TwentyPowerFeaturesSuite({
   effectiveSellerType,
   math,
   dealPackage,
+  dealContext,
   isLight,
   onApplyArvAndRepairs,
   onCopyText,
   copiedId
 }) {
+  const ctx = dealContext || {};
+
   const smartEstimate = useMemo(
     () =>
       autoCalculateArvAndRehabFromInputs({
@@ -46,17 +49,17 @@ export default function TwentyPowerFeaturesSuite({
     [address, conversation, extraNotes, marketMode, math.asking]
   );
 
-  const [selectedRehabIds, setSelectedRehabIds] = useState(['kitchen', 'flooring', 'paint']);
-  const [mortgageBalance, setMortgageBalance] = useState('112000');
-  const [backTaxesLiens, setBackTaxesLiens] = useState('3500');
+  const [selectedRehabIds, setSelectedRehabIds] = useState([]);
+  const [mortgageBalance, setMortgageBalance] = useState('');
+  const [backTaxesLiens, setBackTaxesLiens] = useState('');
   const [subToRate, setSubToRate] = useState('3.75');
   const [sellerCarryDownPct, setSellerCarryDownPct] = useState('10');
   const [sellerCarryYears, setSellerCarryYears] = useState('10');
   const [probateHeirsCount] = useState('2');
   const [pitchLanguage, setPitchLanguage] = useState('en');
   const [subjectSqft] = useState(String(smartEstimate.inferredSqft || 1600));
-  const [compSqft, setCompSqft] = useState('1720');
-  const [compSoldPrice, setCompSoldPrice] = useState('325000');
+  const [compSqft, setCompSqft] = useState('');
+  const [compSoldPrice, setCompSoldPrice] = useState('');
 
   const checklistTotal = useMemo(
     () =>
@@ -67,8 +70,9 @@ export default function TwentyPowerFeaturesSuite({
     [selectedRehabIds]
   );
 
-  const arvVal = math.arv || smartEstimate.estimatedArv || 300000;
-  const repairsVal = math.repairs !== null ? math.repairs : smartEstimate.estimatedRepairs || 35000;
+  const arvVal = math.arv || smartEstimate.estimatedArv || 0;
+  const repairsVal =
+    math.repairs !== null && math.repairs !== undefined ? math.repairs : smartEstimate.estimatedRepairs || 0;
   const maoVal = math.mao || Math.round(arvVal * 0.7 - repairsVal - (math.fee || 10000));
   const openingVal = math.opening || Math.round(maoVal * 0.91);
   const askingVal = math.asking || smartEstimate.inferredAsking || Math.round(arvVal * 0.78);
@@ -101,24 +105,43 @@ export default function TwentyPowerFeaturesSuite({
     if (math.isAskingBelowMao) s += 24;
     else if (math.askingMinusMao && math.askingMinusMao < 20000) s += 12;
     else if (math.askingMinusMao && math.askingMinusMao > 50000) s -= 15;
-    if ((dealPackage?.conversationRead?.motivationScore || 7) >= 8) s += 10;
+    if ((dealPackage?.conversationRead?.motivationScore || 0) >= 8) s += 10;
     return Math.max(15, Math.min(99, s));
   }, [math, dealPackage]);
 
-  const compPpsf =
-    (parseCurrencyNumber(compSoldPrice) || 325000) / Math.max(500, parseCurrencyNumber(compSqft) || 1720);
-  const adjustedSubjectArv = Math.round((parseCurrencyNumber(subjectSqft) || 1600) * compPpsf);
+  const compSoldNum = parseCurrencyNumber(compSoldPrice);
+  const compSqftNum = parseCurrencyNumber(compSqft);
+  const compPpsf = compSoldNum && compSqftNum ? compSoldNum / Math.max(500, compSqftNum) : null;
+  const adjustedSubjectArv = compPpsf
+    ? Math.round((parseCurrencyNumber(subjectSqft) || 0) * compPpsf)
+    : null;
+
+  const propertyLabel = ctx.shortAddress || address || 'the property';
+  const repairScopeLabel = (ctx.conditionItems || []).map((i) => i.label).join(', ');
+  const ageFactsEn = [
+    ctx.hvacAge ? `the HVAC (${ctx.hvacAge} yrs)` : null,
+    ctx.roofAge ? `the roof (${ctx.roofAge} yrs)` : null
+  ].filter(Boolean);
+  const ageFactsAr = [
+    ctx.hvacAge ? `التكييف عمره ${ctx.hvacAge} سنة` : null,
+    ctx.roofAge ? `السقف عمره ${ctx.roofAge} سنة` : null
+  ].filter(Boolean);
+  const timelineEn = ctx.retirement
+    ? ' and closing on your retirement schedule'
+    : ctx.timelineSentence
+    ? ' and working around the date you mentioned'
+    : ' and closing on the date you choose';
 
   const threeOptionLoiText = `LETTER OF INTENT — 3 PURCHASE OPTIONS FOR ${(address || 'SUBJECT PROPERTY').toUpperCase()}
 
 Option A — Fast All-Cash As-Is Close (14–21 Days):
 • Purchase Price: ${formatUSD(maoVal)} NET to Seller
-• Repairs / Cleanout: 100% As-Is (Buyer handles ${formatUSD(repairsVal)} kitchen/rehab after close)
+• Repairs / Cleanout: 100% As-Is (Buyer handles ${formatUSD(repairsVal)}${repairScopeLabel ? ` ${repairScopeLabel}` : ' repairs'} after close)
 • Closing Costs: 100% Paid by Buyer
 
 Option B — Cash + Flexible Move-Out / Post-Occupancy:
 • Purchase Price: ${formatUSD(openingVal)} NET to Seller
-• Includes up to 30 days free post-closing occupancy for smooth retirement transition
+• Includes up to 30 days free post-closing occupancy (flexible move-out)
 
 Option C — Creative Seller-Carry / Terms Offer (Highest Price):
 • Purchase Price: ${formatUSD(creativePurchasePrice)}
@@ -126,17 +149,46 @@ Option C — Creative Seller-Carry / Terms Offer (Highest Price):
 • Monthly Payment to Seller: ${formatUSD(monthlySellerNotePayment)}/mo for ${sellerCarryYears} years`;
 
   const dripSequence = [
-    { day: 'Day 1 (2 hrs post-call)', msg: `Hi! Great speaking with you about ${address}. Here is our locked net cash range (${formatUSD(openingVal)}–${formatUSD(maoVal)}) taking the kitchen 100% as-is.` },
-    { day: 'Day 3 (Check-in)', msg: `Quick check-in on ${address}—did you have any questions on the net-sheet vs. remodeling the kitchen yourself?` },
-    { day: 'Day 7 (Timeline Value)', msg: `Hi! Our title team has an opening to close before your 30-day retirement window at ${formatUSD(maoVal)} net cash. Let me know if you want to hold that spot.` },
-    { day: 'Day 14 (Creative Pivot)', msg: `Still thinking about ${address}? If ${formatUSD(maoVal)} all-cash feels tight, we can also offer ${formatUSD(creativePurchasePrice)} on simple monthly payments.` },
-    { day: 'Day 30 (Final File Check)', msg: `We are finalizing our acquisitions budget for the month—is ${address} still available if we match ${formatUSD(maoVal)} net cash?` }
+    {
+      day: 'Day 1 (2 hrs post-call)',
+      msg: `Hi! Great speaking with you about ${propertyLabel}. Here is our locked net cash range (${formatUSD(openingVal)}–${formatUSD(maoVal)})${repairScopeLabel ? `, buying it 100% as-is including the ${repairScopeLabel}` : ', buying it 100% as-is'}.`
+    },
+    {
+      day: 'Day 3 (Check-in)',
+      msg: `Quick check-in on ${propertyLabel} — did you have any questions on the net sheet vs. repairing it yourself before listing?`
+    },
+    {
+      day: 'Day 7 (Timeline Value)',
+      msg: `Hi! Our title team has an opening to close ${ctx.retirement ? 'before your retirement date' : 'ahead of your deadline'} at ${formatUSD(maoVal)} net cash. Let me know if you want to hold that spot.`
+    },
+    {
+      day: 'Day 14 (Creative Pivot)',
+      msg: `Still thinking about ${propertyLabel}? If ${formatUSD(maoVal)} all-cash feels tight, we can also offer ${formatUSD(creativePurchasePrice)} on simple monthly payments.`
+    },
+    {
+      day: 'Day 30 (Final File Check)',
+      msg: `We are finalizing our acquisitions budget for the month — is ${propertyLabel} still available if we match ${formatUSD(maoVal)} net cash?`
+    }
   ];
 
   const translatedPitch = {
-    en: `“We gave you full credit for your 2.5-year-old HVAC and 7.5-year-old roof, and can pay ${formatUSD(maoVal)} net cash for ${address}, handling the kitchen remodel ourselves and closing within 30 days for your retirement.”`,
-    ar: `«إحنا حسبنالك ميزة إن التكييف عمره سنتين ونص والسقف 7 سنين ونص، ونقدر ندفعلك ${formatUSD(maoVal)} كاش صافي لعقار ${address}، وهنتكفل بتجديد المطبخ بالكامل ونخلص الإجراءات خلال 30 يوم قبل تقاعدك.»`,
-    es: `“Tomamos en cuenta que su aire acondicionado tiene 2.5 años y el techo 7.5 años, y podemos pagarle ${formatUSD(maoVal)} neto en efectivo por ${address}, encargándonos de remodelar la cocina y cerrando en menos de 30 días.”`
+    en: `“${
+      ageFactsEn.length
+        ? `We gave you full credit for ${ageFactsEn.join(' and ')}`
+        : 'We are not deducting for anything you have already updated'
+    }, and can pay ${formatUSD(maoVal)} net cash for ${propertyLabel}${
+      repairScopeLabel ? `, buying it 100% as-is and handling the ${repairScopeLabel} ourselves` : ', buying it 100% as-is'
+    }${timelineEn}.”`,
+    ar: `«${
+      ageFactsAr.length
+        ? `حسبنالك ميزة إن ${ageFactsAr.join(' و')}`
+        : 'مش خصمين أي حاجة اتجددت في العقار'
+    }، ونقدر ندفعلك ${formatUSD(maoVal)} كاش صافي لعقار ${propertyLabel}${
+      repairScopeLabel ? `، وإحنا بنتكفل بـ ${repairScopeLabel} بالكامل` : '، شراء أس-إز بالكامل'
+    }${ctx.retirement ? ' ونخلص قبل تقاعدك' : ''}.»`,
+    es: `“Consideramos el estado real de la propiedad y podemos pagarle ${formatUSD(maoVal)} neto en efectivo por ${propertyLabel}, comprando 100% tal como está${
+      repairScopeLabel ? ' y encargándonos de las reparaciones' : ''
+    }${ctx.retirement ? ', cerrando antes de su jubilación' : ''}.”`
   };
 
   const wrapperCls = isLight
@@ -276,7 +328,7 @@ Option C — Creative Seller-Carry / Terms Offer (Highest Price):
               <div className="flex justify-between"><span>Cash Price:</span><span className="font-mono font-bold">{formatUSD(maoVal)}</span></div>
               <div className="flex justify-between text-emerald-500"><span>6% Commissions:</span><span className="font-mono">$0</span></div>
               <div className="flex justify-between text-emerald-500"><span>Closing Costs:</span><span className="font-mono">$0</span></div>
-              <div className="flex justify-between text-emerald-500"><span>Kitchen Remodel:</span><span className="font-mono">$0 (As-Is)</span></div>
+              <div className="flex justify-between text-emerald-500"><span>{repairScopeLabel || 'Repairs / Cleanout'}:</span><span className="font-mono">$0 (As-Is)</span></div>
               <div className="border-t border-emerald-500/40 pt-1 flex justify-between font-extrabold text-emerald-500">
                 <span>Cash Net:</span>
                 <span className="font-mono">{formatUSD(maoVal)}</span>
@@ -467,10 +519,11 @@ Option C — Creative Seller-Carry / Terms Offer (Highest Price):
             />
             <button
               type="button"
-              onClick={() => onApplyArvAndRepairs(String(adjustedSubjectArv), undefined)}
-              className="bg-indigo-500/15 text-indigo-500 border border-indigo-500/30 rounded text-[10px] font-bold px-1.5"
+              onClick={() => adjustedSubjectArv && onApplyArvAndRepairs(String(adjustedSubjectArv), undefined)}
+              disabled={!adjustedSubjectArv}
+              className="bg-indigo-500/15 text-indigo-500 border border-indigo-500/30 rounded text-[10px] font-bold px-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
             >
-              Use {formatUSD(adjustedSubjectArv)}
+              {adjustedSubjectArv ? `Use ${formatUSD(adjustedSubjectArv)}` : 'Enter comps'}
             </button>
           </div>
         </div>

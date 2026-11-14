@@ -1588,23 +1588,46 @@ Seller Type: ${p.playbook.label}
             )}
 
             {activeTab === 'power20' && (
-              <TwentyPowerFeaturesSuite
-                address={address}
-                conversation={conversation}
-                extraNotes={extraNotes}
-                marketMode={marketMode}
-                effectiveSellerType={effectiveSellerType}
-                math={math}
-                dealPackage={dealPackage}
-                isLight={isLight}
-                onApplyArvAndRepairs={(newArv, newRepairs, newAsking) => {
-                  if (newArv !== undefined) setArv(newArv);
-                  if (newRepairs !== undefined) setRepairs(newRepairs);
-                  if (newAsking !== undefined) setAskingPrice(newAsking);
-                }}
-                onCopyText={copyToClipboard}
-                copiedId={copiedId}
-              />
+              !isDealReady ? (
+                <section
+                  dir="rtl"
+                  className={`border-2 border-dashed border-amber-500/50 rounded-2xl p-4 sm:p-6 text-right ${panelTheme}`}
+                >
+                  <h3 className="text-sm sm:text-base font-extrabold">🚀 أدوات 20x لسه مقفولة</h3>
+                  <p className={`text-[11px] mt-1 ${isLight ? 'text-slate-600' : 'text-zinc-400'}`}>
+                    كل الأدوات هنا (Net Sheet، Creative Finance، Rehab، Deal Score، Pitch، CRM) بتتحسب من
+                    أرقام الصفقة — فمفيش أي نتيجة تقديرية قبل اكتمال البيانات. كمّل
+                    ({dealReadiness.doneCount}/{dealReadiness.total} جاهز) واضغط Analyze.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('analysis')}
+                    className="mt-3 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-extrabold bg-emerald-500 text-slate-950 hover:bg-emerald-400 transition"
+                  >
+                    ⚡ روح لتبويب التحليل
+                  </button>
+                </section>
+              ) : (
+                <TwentyPowerFeaturesSuite
+                  key={`power20-${dealSessionId}`}
+                  address={address}
+                  conversation={conversation}
+                  extraNotes={extraNotes}
+                  marketMode={marketMode}
+                  effectiveSellerType={effectiveSellerType}
+                  math={math}
+                  dealPackage={dealPackage}
+                  dealContext={dealContext}
+                  isLight={isLight}
+                  onApplyArvAndRepairs={(newArv, newRepairs, newAsking) => {
+                    if (newArv !== undefined) setArv(newArv);
+                    if (newRepairs !== undefined) setRepairs(newRepairs);
+                    if (newAsking !== undefined) setAskingPrice(newAsking);
+                  }}
+                  onCopyText={copyToClipboard}
+                  copiedId={copiedId}
+                />
+              )
             )}
 
             {activeTab === 'dispo' && (
