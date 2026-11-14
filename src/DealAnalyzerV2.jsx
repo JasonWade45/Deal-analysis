@@ -221,6 +221,36 @@ export default function App() {
     [address, effectiveSellerType, conversation, extraNotes, math, marketMode]
   );
 
+  // The script is deliberately empty until the deal is real: address, seller
+  // conversation and the two numbers the offer depends on (ARV + repairs).
+  const dealReadiness = useMemo(() => {
+    const items = [
+      { id: 'address', label: 'عنوان العقار', hint: 'اكتب العنوان الكامل في Quick Deal Input', done: address.trim().length >= 3 },
+      {
+        id: 'conversation',
+        label: 'محادثة البايع / ملاحظات المكالمة',
+        hint: 'الصق كلام البايع عن السعر، الصيانة، والتايم لاين',
+        done: conversation.trim().length >= 20
+      },
+      {
+        id: 'arv',
+        label: 'ARV (القيمة بعد التجديد)',
+        hint: 'يتحسب تلقائيًا بزر Analyze أو تدخله يدويًا في Fine-Tune',
+        done: Number(math.arv) > 0
+      },
+      {
+        id: 'repairs',
+        label: 'تكلفة التصليحات',
+        hint: 'تتحسب من المحادثة أو تدخلها في Fine-Tune',
+        done: math.repairs !== null && math.repairs !== undefined && Number(math.repairs) >= 0
+      }
+    ];
+    const doneCount = items.filter((item) => item.done).length;
+    return { items, doneCount, total: items.length, ready: doneCount === items.length };
+  }, [address, conversation, math.arv, math.repairs]);
+
+  const isDealReady = dealReadiness.ready;
+
   // Facts the live co-pilot is allowed to use — scoped to this deal only.
   const dealContext = useMemo(
     () =>
@@ -462,7 +492,12 @@ export default function App() {
   };
 
   const copyToClipboard = (id, text) => {
-    navigator.clipboard.writeText(text);
+    if (!text || !String(text).trim()) return;
+    try {
+      navigator.clipboard?.writeText(text);
+    } catch {
+      // clipboard can be blocked; never break the UI over it
+    }
     setCopiedId(id);
     setTimeout(() => setCopiedId(null), 1800);
 
@@ -553,8 +588,11 @@ export default function App() {
           status: 'done'
         },
         {
-          step: `4. Generated Tailored Seller Script & Live Whisperer Co-Pilot`,
-          status: 'done'
+          step:
+            hasAddr && hasConv && newMath.isComplete
+              ? '4. Generated Tailored Seller Script + Live Whisperer context'
+              : '4. Script stays EMPTY until Address, Conversation, ARV & Repairs are complete',
+          status: hasAddr && hasConv && newMath.isComplete ? 'done' : 'warn'
         }
       ]
     });
@@ -582,6 +620,17 @@ Seller Type: ${p.playbook.label}
   };
 
   const handleShareWhatsApp = () => {
+    if (!isDealReady) {
+      triggerProcessPopup({
+        type: 'orange',
+        title: 'لسه مفيش سكريبت يتبعت — كمّل بيانات الصفقة الأول',
+        processes: [
+          { step: '1. العنوان + محادثة البايع + ARV + التصليحات', status: 'warn' },
+          { step: '2. اضغط Analyze وبعدها ابعت الملخص', status: 'warn' }
+        ]
+      });
+      return;
+    }
     const summaryText = `*Deal Analyzer v2 — ${address || 'Property'}*\n• *ARV:* ${formatUSD(
       math.arv,
       'Missing'
@@ -1245,6 +1294,111 @@ Seller Type: ${p.playbook.label}
 
             {activeTab === 'analysis' && (
               <div className="space-y-5">
+                {!isDealReady && (
+                  <section
+                    dir="rtl"
+                    className={`border-2 border-dashed border-amber-500/50 rounded-2xl p-4 sm:p-6 ${panelTheme}`}
+                  >
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="flex items-start gap-3">
+                        <span className="w-9 h-9 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-400 flex items-center justify-center shrink-0">
+                          <Quote className="w-4 h-4" />
+                        </span>
+                        <div>
+                          <h3 className="text-sm sm:text-base font-extrabold text-right">
+                            ✍️ السكريبت فاضي — مستني بيانات الصفقة
+                          </h3>
+                          <p className={`text-[11px] mt-1 text-right ${isLight ? 'text-slate-600' : 'text-zinc-400'}`}>
+                            مفيش أي كلام بيتولّد قبل ما البيانات تبقى كاملة. كمّل العناصر الناقصة واضغط
+                            <span className="font-bold text-emerald-500"> Analyze</span>، وبعدها السكريبت
+                            والتحليل بيتكتبوا بأرقام الديل الحقيقية — بدون فراغات ولا أرقام تقديرية.
+                          </p>
+                        </div>
+                      </div>
+                      <span className="px-2.5 py-1 rounded-lg text-[11px] font-extrabold bg-amber-500/15 text-amber-400 border border-amber-500/30">
+                        {dealReadiness.doneCount}/{dealReadiness.total} جاهز
+                      </span>
+                    </div>
+
+                    <div className="mt-4 h-1.5 rounded-full bg-slate-500/20 overflow-hidden">
+                      <div
+                        className="h-full bg-emerald-500 transition-all"
+                        style={{ width: `${Math.round((dealReadiness.doneCount / dealReadiness.total) * 100)}%` }}
+                      />
+                    </div>
+
+                    <ul className="mt-4 space-y-2">
+                      {dealReadiness.items.map((item) => (
+                        <li
+                          key={item.id}
+                          className={`flex flex-wrap items-center justify-between gap-2 rounded-xl border px-3 py-2 ${
+                            item.done
+                              ? 'border-emerald-500/30 bg-emerald-500/5'
+                              : isLight
+                              ? 'border-slate-300 bg-slate-50'
+                              : 'border-zinc-700 bg-zinc-900/60'
+                          }`}
+                        >
+                          <div className="flex items-start gap-2">
+                            {item.done ? (
+                              <CheckCircle2 className="w-4 h-4 text-emerald-500 shrink-0 mt-0.5" />
+                            ) : (
+                              <span className="w-4 h-4 rounded-full border-2 border-amber-500/60 shrink-0 mt-0.5" />
+                            )}
+                            <div className="text-right">
+                              <p className="text-[11px] font-bold">{item.label}</p>
+                              {!item.done && (
+                                <p className={`text-[10px] ${isLight ? 'text-slate-500' : 'text-zinc-500'}`}>
+                                  {item.hint}
+                                </p>
+                              )}
+                            </div>
+                          </div>
+                          {!item.done && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (item.id === 'address') focusTarget('address');
+                                else if (item.id === 'conversation') focusTarget('conversation');
+                                else setShowAdvancedInputs(true);
+                              }}
+                              className="px-2.5 py-1 rounded-lg text-[10px] font-extrabold bg-emerald-500 text-slate-950 hover:bg-emerald-400 transition"
+                            >
+                              {item.id === 'address' || item.id === 'conversation' ? 'روح للخانة' : 'افتح Fine-Tune'}
+                            </button>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+
+                    <div className="mt-4 flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={runInstantAutoUnderwrite}
+                        className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-extrabold bg-emerald-500 text-slate-950 hover:bg-emerald-400 transition"
+                      >
+                        <Zap className="w-3.5 h-3.5" /> حلّل الديل دلوقتي (Analyze)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setShowAdvancedInputs(true)}
+                        className={`inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-bold border transition ${
+                          isLight
+                            ? 'bg-slate-100 border-slate-300 text-slate-700 hover:bg-slate-200'
+                            : 'bg-zinc-800 border-zinc-700 text-zinc-200 hover:bg-zinc-700'
+                        }`}
+                      >
+                        <Sliders className="w-3.5 h-3.5" /> إدخال ARV &amp; التصليحات يدويًا
+                      </button>
+                      <span className={`text-[10px] ${isLight ? 'text-slate-500' : 'text-zinc-500'}`}>
+                        الحاسبة لسه <span className="font-mono font-bold">ESTIMATE ONLY</span> لحد ما الأرقام تكتمل.
+                      </span>
+                    </div>
+                  </section>
+                )}
+
+                {isDealReady && (
+                  <>
                 <section className={`border-2 border-emerald-500/40 rounded-2xl p-4 sm:p-6 ${panelTheme}`}>
                   <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
                     <div className="flex items-center gap-2.5">
@@ -1411,6 +1565,8 @@ Seller Type: ${p.playbook.label}
                     </table>
                   </div>
                 </section>
+                  </>
+                )}
               </div>
             )}
 
@@ -1421,7 +1577,7 @@ Seller Type: ${p.playbook.label}
                 selectedModel={selectedGeminiModel}
                 address={address}
                 playbook={SELLER_PLAYBOOK[effectiveSellerType] || SELLER_PLAYBOOK.distressed}
-                scriptPackage={dealPackage.script}
+                scriptPackage={isDealReady ? dealPackage.script : null}
                 math={math}
                 dealContext={dealContext}
                 isLight={isLight}
@@ -1453,6 +1609,28 @@ Seller Type: ${p.playbook.label}
 
             {activeTab === 'dispo' && (
               <div className="space-y-5">
+                {!isDealReady && (
+                  <section
+                    dir="rtl"
+                    className={`border-2 border-dashed border-amber-500/50 rounded-2xl p-4 sm:p-6 text-right ${panelTheme}`}
+                  >
+                    <h3 className="text-sm sm:text-base font-extrabold">📝 العقد ورسالة المشترين فاضيين</h3>
+                    <p className={`text-[11px] mt-1 ${isLight ? 'text-slate-600' : 'text-zinc-400'}`}>
+                      مفيش عقد ولا رسالة توزيع بتتولّد بأرقام ناقصة. كمّل بيانات الصفقة
+                      ({dealReadiness.doneCount}/{dealReadiness.total} جاهز) واضغط Analyze، وبعدها الأرقام
+                      بتتقفل في الحاسبة ويظهر العقد الصحيح.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('analysis')}
+                      className="mt-3 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-extrabold bg-emerald-500 text-slate-950 hover:bg-emerald-400 transition"
+                    >
+                      ⚡ روح لتبويب التحليل
+                    </button>
+                  </section>
+                )}
+
+                {isDealReady && (
                 <section className={`border rounded-2xl p-5 space-y-4 ${panelTheme}`}>
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <h3 className="text-base font-extrabold flex items-center gap-2">
@@ -1471,7 +1649,7 @@ Seller Type: ${p.playbook.label}
                         onClick={() =>
                           copyToClipboard(
                             'dispo-sms',
-                            `📢 OFF-MARKET DEAL (${address}): Buy at ${formatUSD((math.target || 192500) + (math.fee || 10000))} Cash | ARV: ${formatUSD(math.arv || 330000)} | Rehab: ${formatUSD(math.repairs || 28500)} (2.5-yr HVAC & 7.5-yr Roof!). Reply for walkthrough access.`
+                            `📢 OFF-MARKET DEAL (${address}): Buy at ${formatUSD(math.target + math.fee)} Cash | ARV: ${formatUSD(math.arv)} | Rehab: ${formatUSD(math.repairs)} (${dealPackage.numbersSummary.repairLevel}). Reply for walkthrough access.`
                           )
                         }
                         className="px-3 py-1.5 rounded-xl bg-emerald-500 text-slate-950 text-xs font-extrabold"
@@ -1501,6 +1679,7 @@ Property Address: ${address || '[PROPERTY ADDRESS]'}
    • Closing within ${dealPackage.market.closingDays} at licensed Title Company.`}
                   </pre>
                 </section>
+                )}
               </div>
             )}
           </div>

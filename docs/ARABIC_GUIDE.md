@@ -21,6 +21,8 @@
 - **شريط الأرقام المقفولة** أعلى الشاشة: ARV • Repairs • MAO • Opening • Target • Walk-Away • Asking − MAO.
   - اللون الأحمر في «Asking − MAO» يعني أن طلب البايع أعلى من سقفك.
   - رسالة **ESTIMATE ONLY** تعني أن ARV أو الصيانة ناقصة — اضغط Analyze أو أدخلهم من **Fine-Tune**.
+  - **السكريبت فاضي لحد ما الديل يكتمل:** تبويب «Deal Analysis & Script» بيعرض 4 عناصر (العنوان — محادثة البايع — ARV — التصليحات). طول ما فيه عنصر ناقص مفيش أي كلام ولا فراغات زي `[OPENING OFFER — ESTIMATE ONLY]`. عند 4/4 واضغط **Analyze** → السكريبت بيتكتب بأرقام الصفقة الحقيقية ونوع البايع المستخرج من المحادثة.
+  - نفس القاعدة على **Dispo & Contract**: العقد ورسالة المشترين مش بيظهروا قبل اكتمال البيانات.
 - **Tailored Seller Script**: Opening & Rapport → Bridge → Exact Offer Delivery → 3 ردود اعتراضات → Close + Follow-up SMS، مع زر **Copy Script**.
 - **Property Snapshot**: اضغط شارة التحقق لتبديلها (VERIFIED → ESTIMATE → UNVERIFIED)، واستخدم Zillow / Redfin / County Record للتأكد.
 
