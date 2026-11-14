@@ -108,6 +108,25 @@ export function detectSellerTypeFromConversation(conversation = '', extraNotes =
   return 'distressed';
 }
 
+// A clean workspace: the app boots empty and the user adds the real deal.
+// Demo deals stay available from the "Load Sample Deal" menu.
+export const BLANK_DEAL = {
+  id: 'blank-deal',
+  title: 'Blank Property',
+  address: '',
+  sellerType: 'auto',
+  marketMode: 'national',
+  askingPrice: '',
+  arv: '',
+  repairs: '',
+  maoPercent: '70',
+  assignmentFee: '10000',
+  cushionPercent: '9',
+  testOffer: '',
+  extraNotes: '',
+  conversation: ''
+};
+
 export const PRESET_DEALS = [
   {
     id: 'preset-retirement-call',

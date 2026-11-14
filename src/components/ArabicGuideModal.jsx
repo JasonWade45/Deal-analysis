@@ -16,6 +16,7 @@ import {
   Lightbulb,
   ExternalLink
 } from 'lucide-react';
+import { GUIDE_PROGRESS_KEY as GUIDE_STORAGE_KEY, GUIDE_SEEN_KEY } from '../lib/storage.js';
 
 // ============================================================================
 // 📖 دليل الاستخدام التفاعلي بالعربية — INTERACTIVE ARABIC USAGE GUIDE
@@ -24,8 +25,7 @@ import {
 // - FAQ accordion + reset progress
 // ============================================================================
 
-const GUIDE_STORAGE_KEY = 'deal_analyzer_guide_progress_v1';
-const GUIDE_AUTOSHOW_KEY = 'deal_analyzer_guide_seen_v1';
+export const GUIDE_AUTOSHOW_KEY = GUIDE_SEEN_KEY;
 
 const GUIDE_SECTIONS = [
   { id: 'quickstart', label: '1️⃣ البداية السريعة', icon: Sparkles },
@@ -134,7 +134,11 @@ const GUIDE_STEPS = [
     title: 'احفظ الصفقة أو ابدأ صفقة جديدة',
     detail:
       'اضغط «💾 Save & + New» لحفظ الصفقة الحالية في History والبدء بعقار جديد فوراً، أو «Save Current Deal» من قائمة More Tools.',
-    tips: ['بياناتك تُحفظ في متصفحك (localStorage) وتبقى بعد إغلاق الصفحة.'],
+    tips: [
+      'بياناتك تُحفظ في متصفحك (localStorage) وتبقى بعد إغلاق الصفحة.',
+      '🧹 «تفريغ النظام» (من More Tools أو من نافذة Saved) بيمسح كل الصفقات المحفوظة وتقدم الدليل وبصمة الصوت ويرجّع مساحة عمل فاضية — مفتاح Gemini بيفضل محفوظ.',
+      'التطبيق يفتح فاضي افتراضيًا؛ الصفقات التجريبية من قائمة «📂 Load Sample Deal»، والحد الأقصى 50 صفقة محفوظة.'
+    ],
     action: { type: 'save-new', label: '💾 احفظ وابدأ جديد' }
   },
   {
@@ -611,4 +615,3 @@ export default function ArabicGuideModal({
   );
 }
 
-export { GUIDE_AUTOSHOW_KEY };

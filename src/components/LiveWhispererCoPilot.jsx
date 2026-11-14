@@ -26,6 +26,7 @@ import {
   isWebSpeechSupported,
   transcribeAudioBlob
 } from '../lib/audioTranscriber.js';
+import { VOICE_PROFILE_KEY } from '../lib/storage.js';
 import {
   INTENT_LABELS,
   buildGeminiPrompt,
@@ -126,7 +127,7 @@ export default function LiveWhispererCoPilot({
 
   const [agentVoiceProfile, setAgentVoiceProfile] = useState(() => {
     try {
-      const saved = localStorage.getItem('deal_analyzer_voice_profile');
+      const saved = localStorage.getItem(VOICE_PROFILE_KEY);
       if (saved) return JSON.parse(saved);
     } catch {
       // ignore
@@ -225,7 +226,7 @@ export default function LiveWhispererCoPilot({
   useEffect(() => {
     agentVoiceProfileRef.current = agentVoiceProfile;
     try {
-      localStorage.setItem('deal_analyzer_voice_profile', JSON.stringify(agentVoiceProfile));
+      localStorage.setItem(VOICE_PROFILE_KEY, JSON.stringify(agentVoiceProfile));
     } catch {
       // ignore
     }
