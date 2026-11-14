@@ -23,6 +23,8 @@
   - رسالة **ESTIMATE ONLY** تعني أن ARV أو الصيانة ناقصة — اضغط Analyze أو أدخلهم من **Fine-Tune**.
   - **السكريبت فاضي لحد ما الديل يكتمل:** تبويب «Deal Analysis & Script» بيعرض 4 عناصر (العنوان — محادثة البايع — ARV — التصليحات). طول ما فيه عنصر ناقص مفيش أي كلام ولا فراغات زي `[OPENING OFFER — ESTIMATE ONLY]`. عند 4/4 واضغط **Analyze** → السكريبت بيتكتب بأرقام الصفقة الحقيقية ونوع البايع المستخرج من المحادثة.
   - نفس القاعدة على **Dispo & Contract**: العقد ورسالة المشترين مش بيظهروا قبل اكتمال البيانات.
+  - نفس القاعدة على **20x Power Tools**: كل الأدوات (Net Sheet، Creative Finance، Deal Score، Pitch، CRM) مقفولة قبل 4/4، وكل حقل فيها (Payoff، Liens، Comps، Checklist) بيبدأ **فاضي** — مفيش أرقام ديمو محفوظة.
+  - أي **New Deal** أو تحميل صفقة تانية بيصفّر أدوات 20x أيضًا (الاختيارات والحقول بترجع فاضية) لحد ما تدخل بيانات البيت الجديد.
 - **Tailored Seller Script**: Opening & Rapport → Bridge → Exact Offer Delivery → 3 ردود اعتراضات → Close + Follow-up SMS، مع زر **Copy Script**.
 - **Property Snapshot**: اضغط شارة التحقق لتبديلها (VERIFIED → ESTIMATE → UNVERIFIED)، واستخدم Zillow / Redfin / County Record للتأكد.
 
