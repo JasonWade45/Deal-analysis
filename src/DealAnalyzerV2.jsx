@@ -36,11 +36,20 @@ import {
 import { formatUSD, hasInvalidNumberChars, calculateDealMath } from './lib/dealMath.js';
 import { autoCalculateArvAndRehabFromInputs } from './lib/dealMath.js';
 import {
+  BLANK_DEAL,
   MARKET_MODES,
   PRESET_DEALS,
   SELLER_PLAYBOOK,
   detectSellerTypeFromConversation
 } from './lib/playbooks.js';
+import {
+  MAX_SAVED_DEALS,
+  loadSavedDeals,
+  migrateStorage,
+  saveSavedDeals,
+  storageFacts,
+  wipeDealData
+} from './lib/storage.js';
 import { buildBaselineAnalysis } from './lib/analysis.js';
 import { buildDealContext } from './lib/dealContext.js';
 import {
@@ -78,18 +87,18 @@ export default function App() {
     }
   };
 
-  const [address, setAddress] = useState(PRESET_DEALS[0].address);
-  const [sellerType, setSellerType] = useState(PRESET_DEALS[0].sellerType);
-  const [marketMode, setMarketMode] = useState(PRESET_DEALS[0].marketMode);
-  const [askingPrice, setAskingPrice] = useState(PRESET_DEALS[0].askingPrice);
-  const [arv, setArv] = useState(PRESET_DEALS[0].arv);
-  const [repairs, setRepairs] = useState(PRESET_DEALS[0].repairs);
-  const [maoPercent, setMaoPercent] = useState(PRESET_DEALS[0].maoPercent);
-  const [assignmentFee, setAssignmentFee] = useState(PRESET_DEALS[0].assignmentFee);
-  const [cushionPercent, setCushionPercent] = useState(PRESET_DEALS[0].cushionPercent);
-  const [testOffer, setTestOffer] = useState(PRESET_DEALS[0].testOffer);
-  const [conversation, setConversation] = useState(PRESET_DEALS[0].conversation);
-  const [extraNotes, setExtraNotes] = useState(PRESET_DEALS[0].extraNotes);
+  const [address, setAddress] = useState(BLANK_DEAL.address);
+  const [sellerType, setSellerType] = useState(BLANK_DEAL.sellerType);
+  const [marketMode, setMarketMode] = useState(BLANK_DEAL.marketMode);
+  const [askingPrice, setAskingPrice] = useState(BLANK_DEAL.askingPrice);
+  const [arv, setArv] = useState(BLANK_DEAL.arv);
+  const [repairs, setRepairs] = useState(BLANK_DEAL.repairs);
+  const [maoPercent, setMaoPercent] = useState(BLANK_DEAL.maoPercent);
+  const [assignmentFee, setAssignmentFee] = useState(BLANK_DEAL.assignmentFee);
+  const [cushionPercent, setCushionPercent] = useState(BLANK_DEAL.cushionPercent);
+  const [testOffer, setTestOffer] = useState(BLANK_DEAL.testOffer);
+  const [conversation, setConversation] = useState(BLANK_DEAL.conversation);
+  const [extraNotes, setExtraNotes] = useState(BLANK_DEAL.extraNotes);
 
   const [showAdvancedInputs, setShowAdvancedInputs] = useState(false);
   const [showToolsMenu, setShowToolsMenu] = useState(false);
@@ -151,41 +160,18 @@ export default function App() {
   };
 
   const [savedDeals, setSavedDeals] = useState(() => {
+    // Boot hygiene: purge keys from older builds, repair a corrupt history and
+    // start with an empty list (no demo deal is injected any more).
     try {
-      const raw = localStorage.getItem('deal_analyzer_v2_history');
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-      }
+      migrateStorage();
     } catch {
       // ignore
     }
-    return [
-      {
-        id: 'saved-demo-1',
-        date: '2026-02-20 14:15',
-        status: 'Offer Made',
-        address: PRESET_DEALS[0].address,
-        sellerType: PRESET_DEALS[0].sellerType,
-        marketMode: PRESET_DEALS[0].marketMode,
-        askingPrice: PRESET_DEALS[0].askingPrice,
-        arv: PRESET_DEALS[0].arv,
-        repairs: PRESET_DEALS[0].repairs,
-        maoPercent: PRESET_DEALS[0].maoPercent,
-        assignmentFee: PRESET_DEALS[0].assignmentFee,
-        cushionPercent: PRESET_DEALS[0].cushionPercent,
-        extraNotes: PRESET_DEALS[0].extraNotes,
-        conversation: PRESET_DEALS[0].conversation
-      }
-    ];
+    return loadSavedDeals();
   });
 
   useEffect(() => {
-    try {
-      localStorage.setItem('deal_analyzer_v2_history', JSON.stringify(savedDeals));
-    } catch {
-      // ignore
-    }
+    saveSavedDeals(savedDeals);
   }, [savedDeals]);
 
   // First visit → open the interactive Arabic guide once.
@@ -356,7 +342,7 @@ export default function App() {
       extraNotes,
       conversation
     };
-    setSavedDeals((prev) => [newEntry, ...prev]);
+    setSavedDeals((prev) => [newEntry, ...prev].slice(0, MAX_SAVED_DEALS));
     return true;
   };
 
@@ -404,6 +390,44 @@ export default function App() {
   };
 
   const handleStartNewProperty = () => clearToBlankProperty();
+
+  // 🧹 Full reset: remove every key this app owns (saved deals, guide progress,
+  // voice profile, cached suggestions) and return to an empty workspace.
+  const handleWipeSystem = () => {
+    const facts = storageFacts();
+    const confirmed = window.confirm(
+      [
+        'تفريغ النظام بالكامل؟',
+        '',
+        `• صفقات محفوظة: ${facts.savedDeals}`,
+        `• مفاتيح بيانات في المتصفح: ${facts.keyCount}`,
+        '• تقدم دليل الاستخدام + بصمة الصوت + أي مقترحات محفوظة',
+        '',
+        'مفتاح Gemini والموديل والثيم هيفضلوا محفوظين.',
+        'مش ممكن التراجع بعد المسح.'
+      ].join('\n')
+    );
+    if (!confirmed) return;
+
+    const { removed } = wipeDealData({ keepApiKey: true, keepTheme: true });
+    setSavedDeals([]);
+    setCustomConfidenceMap({});
+    setAiError(null);
+    setShowHistoryDrawer(false);
+    setShowToolsMenu(false);
+    clearToBlankProperty({ silent: true });
+
+    triggerProcessPopup({
+      type: 'green',
+      title: '🧹 تم تفريغ النظام — بداية نظيفة',
+      processes: [
+        { step: `1. مسح ${removed.length} مفتاح بيانات قديم`, status: 'done' },
+        { step: '2. حذف كل الصفقات المحفوظة وتقدم الدليل', status: 'done' },
+        { step: '3. تصفير بصمة الصوت ومقترحات المكالمات الحية', status: 'done' },
+        { step: `4. مساحة عمل فاضية جاهزة (الحد الأقصى ${MAX_SAVED_DEALS} صفقة محفوظة)`, status: 'done' }
+      ]
+    });
+  };
 
   // 💾 Save & + New — save the current deal, then reset to a blank workspace.
   const handleSaveAndNew = () => {
@@ -880,6 +904,17 @@ Seller Type: ${p.playbook.label}
                     className="w-full flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-semibold hover:bg-emerald-500/15 text-left"
                   >
                     <BookOpen className="w-4 h-4 text-emerald-500" /> 📖 شرح الاستخدام (عربي)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowToolsMenu(false);
+                      handleWipeSystem();
+                    }}
+                    className="w-full flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-bold text-rose-400 hover:bg-rose-500/15 border-t border-rose-500/20 mt-1 pt-2 text-left"
+                    title="مسح الصفقات المحفوظة وتقدم الدليل وبصمة الصوت والرجوع لمساحة عمل فاضية"
+                  >
+                    <Trash2 className="w-4 h-4" /> 🧹 تفريغ النظام (مسح كل البيانات)
                   </button>
                 </div>
               )}
@@ -1615,9 +1650,19 @@ End-Buyer Price: ${math.isComplete ? formatUSD(math.target + math.fee) : 'ESTIMA
               <h3 className="text-sm font-extrabold flex items-center gap-2">
                 <History className="w-4 h-4 text-amber-500" /> Saved Deals ({savedDeals.length})
               </h3>
-              <button type="button" onClick={() => setShowHistoryDrawer(false)} className="text-xs">
-                Close ✕
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleWipeSystem}
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-extrabold text-rose-400 border border-rose-500/40 hover:bg-rose-500/15 transition"
+                  title="مسح كل الصفقات المحفوظة وتقدم الدليل وبصمة الصوت"
+                >
+                  <Trash2 className="w-3 h-3" /> تفريغ النظام
+                </button>
+                <button type="button" onClick={() => setShowHistoryDrawer(false)} className="text-xs">
+                  Close ✕
+                </button>
+              </div>
             </div>
             <div className="flex-1 overflow-y-auto space-y-3">
               {savedDeals.map((d) => {
