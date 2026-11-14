@@ -22,6 +22,11 @@ import {
   isClearlyAgentSelfIntroOrPitch
 } from '../lib/liveCoPilot.js';
 import {
+  isRecorderSupported,
+  isWebSpeechSupported,
+  transcribeAudioBlob
+} from '../lib/audioTranscriber.js';
+import {
   INTENT_LABELS,
   buildGeminiPrompt,
   buildQuickPrompts,
@@ -45,6 +50,9 @@ import {
 // - Seller speech is no longer mistaken for the agent's script: a detected
 //   seller intent wins unless the match to the agent script is very strong.
 // ============================================================================
+
+const INTERIM_COMMIT_MS = 1200;
+const RECORDER_MAX_MS = 15000;
 
 const CUE_REGEX = /\b(?:wait|hold on|stop|listen|look|no way|nah|actually|hang on|excuse me|sorry)\b|استنى|ثانية|لحظة|لا لا|بص|اسمعني/i;
 const NEUTRAL_TONE = {
@@ -94,6 +102,14 @@ export default function LiveWhispererCoPilot({
   const [silenceDelayMs, setSilenceDelayMs] = useState(900);
   const [callLog, setCallLog] = useState([]);
   const [manualSellerInput, setManualSellerInput] = useState('');
+  const [micError, setMicError] = useState('');
+  const [micEngine, setMicEngine] = useState(() =>
+    isWebSpeechSupported() ? 'webspeech' : isRecorderSupported() ? 'recorder' : 'none'
+  );
+  const [heardText, setHeardText] = useState('');
+  const [ignoredSpeech, setIgnoredSpeech] = useState(null);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
   const [liveCustomOffer, setLiveCustomOffer] = useState(null);
   const [callNumber, setCallNumber] = useState(0);
   const [callStartedAt, setCallStartedAt] = useState(null);
@@ -145,6 +161,15 @@ export default function LiveWhispererCoPilot({
   const muteMyVoiceRef = useRef(false);
   const lastAgentSpeechAtRef = useRef(0);
   const lastUtteranceRef = useRef({ text: '', at: 0 });
+  const listenModeRef = useRef('handsfree');
+  const speechLangRef = useRef('en-US');
+  const restartTimerRef = useRef(null);
+  const restartAttemptsRef = useRef(0);
+  const commitBufferRef = useRef('');
+  const recorderRef = useRef(null);
+  const recorderChunksRef = useRef([]);
+  const recorderTimerRef = useRef(null);
+  const isRecordingRef = useRef(false);
 
   const audioContextRef = useRef(null);
   const analyserRef = useRef(null);
@@ -182,6 +207,20 @@ export default function LiveWhispererCoPilot({
   useEffect(() => {
     muteMyVoiceRef.current = muteMyVoice;
   }, [muteMyVoice]);
+
+  useEffect(() => {
+    listenModeRef.current = listenMode;
+  }, [listenMode]);
+
+  useEffect(() => {
+    speechLangRef.current = speechLang;
+  }, [speechLang]);
+
+  useEffect(() => {
+    if (isWebSpeechSupported()) setMicEngine('webspeech');
+    else if (isRecorderSupported()) setMicEngine('recorder');
+    else setMicEngine('none');
+  }, []);
 
   useEffect(() => {
     agentVoiceProfileRef.current = agentVoiceProfile;
@@ -409,9 +448,25 @@ export default function LiveWhispererCoPilot({
     const text = String(rawText || '').trim();
     if (text.length < 2) return;
 
+    // speechLangRef is updated the moment the language button is pressed; the
+    // `lang` captured in this closure can still be the previous render's value.
+    const replyLang = speechLangRef.current === 'ar-EG' ? 'ar' : 'en';
+
     const now = Date.now();
-    if (text === lastUtteranceRef.current.text && now - lastUtteranceRef.current.at < 2500) return;
+    const norm = (v) =>
+      String(v).toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+    const prevUtterance = lastUtteranceRef.current;
+    if (now - prevUtterance.at < 5000) {
+      const current = norm(text);
+      const previous = norm(prevUtterance.text);
+      if (current && previous && (current === previous || current.startsWith(previous) || previous.startsWith(current))) {
+        return;
+      }
+    }
     lastUtteranceRef.current = { text, at: now };
+    setHeardText(text);
+    setIgnoredSpeech(null);
+    setMicError('');
 
     const intentInfo = detectSellerIntent(text);
     const sellerTone = detectSpeakerTone({
@@ -439,7 +494,7 @@ export default function LiveWhispererCoPilot({
       ctx,
       wasBargeIn,
       sellerToneId: sellerTone.id,
-      lang,
+      lang: replyLang,
       turn: callLog.filter((t) => t.role === 'seller').length
     });
 
@@ -481,7 +536,7 @@ export default function LiveWhispererCoPilot({
                     text: buildGeminiPrompt({
                       sellerSpeech: text,
                       ctx,
-                      lang,
+                      lang: replyLang,
                       wasBargeIn,
                       toneLabel: sellerTone.label,
                       turn: callLog.length + 1,
@@ -525,10 +580,12 @@ export default function LiveWhispererCoPilot({
   const processCapturedSpeech = (spokenText) => {
     const trimmed = String(spokenText || '').trim();
     if (trimmed.length < 2) return;
+    setHeardText(trimmed);
 
     if (muteMyVoiceRef.current) {
       autoUpdateAgentVoiceprint();
       setLastIgnoredUserText(`🔇 (Muted) "${trimmed.slice(0, 70)}"`);
+      setIgnoredSpeech({ text: trimmed, reason: 'زر «Mute» شغال — بيتم تجاهل كل الكلام.' });
       setLiveText('');
       unspokenBufferRef.current = '';
       return;
@@ -546,15 +603,18 @@ export default function LiveWhispererCoPilot({
 
       const voiceMatch = compareWithAgentVoiceProfile(liveAcousticRef.current, agentVoiceProfileRef.current);
 
+      // Only a near-exact match counts as the agent's own voice. The old 0.30
+      // prefix rule and the 0.70 similarity rule were swallowing real seller
+      // sentences, which read as "the mic does not understand me".
       const looksLikeAgent =
-        (progress.isPrefixOfScript && progress.progressRatio >= 0.3) ||
-        maxSim >= Math.max(0.7, similarityThreshold) ||
-        isClearlyAgentSelfIntroOrPitch(trimmed);
+        (progress.isPrefixOfScript && progress.progressRatio >= 0.55) ||
+        maxSim >= Math.max(0.78, similarityThreshold) ||
+        (isClearlyAgentSelfIntroOrPitch(trimmed) && maxSim >= 0.5);
 
       // A clear seller intent (price, timeline, repairs, family, payoff...) wins
       // unless the utterance is a near-exact match to the agent's own script.
       const strongSellerIntent = intentInfo.matched && intentInfo.id !== 'greeting' && intentInfo.id !== 'question';
-      const isAgentSpeaking = looksLikeAgent && !(strongSellerIntent && maxSim < 0.8);
+      const isAgentSpeaking = looksLikeAgent && !(strongSellerIntent && maxSim < 0.92);
 
       if (isAgentSpeaking) {
         lastAgentSpeechAtRef.current = Date.now();
@@ -568,6 +628,10 @@ export default function LiveWhispererCoPilot({
         setLastIgnoredUserText(
           `"${trimmed.slice(0, 60)}..." (${pct}% تطابق • بصمة الصوت ${voiceMatch.matchConfidence || 0}%)`
         );
+        setIgnoredSpeech({
+          text: trimmed,
+          reason: `حسبتها إنت بتقرأ السكريبت (${pct}% تطابق). لو دي جملة البايع، اضغط «رد على الجملة دي».`
+        });
         setLiveText('');
         unspokenBufferRef.current = '';
         return;
@@ -589,39 +653,101 @@ export default function LiveWhispererCoPilot({
     stopAcousticAnalyzer();
     if (pendingUtteranceRef.current) clearTimeout(pendingUtteranceRef.current);
     if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
+    commitBufferRef.current = '';
     if (recognitionRef.current) {
+      const current = recognitionRef.current;
+      current.onend = null;
       try {
-        recognitionRef.current.stop();
+        current.stop();
       } catch {
         // ignore
       }
+      recognitionRef.current = null;
     }
+    if (isRecordingRef.current) stopRecorder();
     setCallEndedAt((prev) => prev || Date.now());
   };
 
-  const startSpeechEngine = () => {
+  const scheduleRecognitionRestart = (recognition, delay = 250) => {
+    if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
+    restartTimerRef.current = setTimeout(() => {
+      if (!isListeningRef.current || recognitionRef.current !== recognition) return;
+      try {
+        recognition.start();
+        restartAttemptsRef.current = 0;
+      } catch {
+        restartAttemptsRef.current += 1;
+        if (restartAttemptsRef.current <= 6) {
+          scheduleRecognitionRestart(recognition, 800);
+        } else {
+          setMicError('التعرف على الكلام وقف من نفسه. اضغط «بدء الاستماع» تاني، أو استخدم زر «سجّل كلام البايع».');
+          isListeningRef.current = false;
+          setIsListening(false);
+        }
+      }
+    }, delay);
+  };
+
+  // Chrome often delivers Arabic (and long) speech as interim results only.
+  // Committing the interim buffer after a short silence is what makes the
+  // co-pilot answer at all on those browsers.
+  const scheduleInterimCommit = (text) => {
+    commitBufferRef.current = text;
+    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    silenceTimerRef.current = setTimeout(() => {
+      const pending = commitBufferRef.current;
+      commitBufferRef.current = '';
+      if (pending && pending === unspokenBufferRef.current) {
+        unspokenBufferRef.current = '';
+        processCapturedSpeech(pending);
+      }
+    }, INTERIM_COMMIT_MS);
+  };
+
+  const startSpeechEngine = ({ langOverride } = {}) => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) {
-      setAiError('التعرف على الصوت يحتاج Google Chrome أو Microsoft Edge. يمكنك التجربة بكتابة كلام البايع في الأسفل.');
+      const recorderOk = isRecorderSupported();
+      setMicEngine(recorderOk ? 'recorder' : 'none');
+      setMicError(
+        recorderOk
+          ? 'المتصفح ده مش بيدعم التعرف المباشر على الكلام (Safari / Firefox / بعض متصفحات الموبايل). استخدم زر «🎙️ سجّل كلام البايع» — هيسجل صوتك ويحوّله نص بالـ AI، أو اكتب في الخانة تحت.'
+          : 'المتصفح ده مش بيدعم التعرف على الكلام ولا التسجيل. افتح الصفحة على Chrome أو Edge، أو اكتب كلام البايع في الخانة تحت.'
+      );
       return;
     }
 
+    setMicEngine('webspeech');
+    setMicError('');
     startAcousticAnalyzer();
 
+    const activeLang = langOverride || speechLangRef.current;
+    speechLangRef.current = activeLang;
+
+    if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
+    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
     if (recognitionRef.current) {
+      const old = recognitionRef.current;
+      old.onend = null;
+      old.onerror = null;
+      old.onresult = null;
       try {
-        recognitionRef.current.stop();
+        old.stop();
       } catch {
         // ignore
       }
+      recognitionRef.current = null;
     }
 
     unspokenBufferRef.current = '';
+    commitBufferRef.current = '';
 
     const recognition = new SpeechRecognition();
     recognition.continuous = true;
     recognition.interimResults = true;
-    recognition.lang = speechLang;
+    recognition.maxAlternatives = 1;
+    recognition.lang = activeLang;
 
     recognition.onresult = (event) => {
       let interim = '';
@@ -638,6 +764,7 @@ export default function LiveWhispererCoPilot({
 
       if (interim.trim()) {
         unspokenBufferRef.current = interim.trim();
+        scheduleInterimCommit(interim.trim());
         if (CUE_REGEX.test(interim) && Date.now() - lastAgentSpeechAtRef.current < 9000) {
           setTurnStatusBadge({
             type: 'seller_barge_in',
@@ -649,26 +776,42 @@ export default function LiveWhispererCoPilot({
 
       if (finals.trim()) {
         const text = finals.trim();
+        commitBufferRef.current = '';
+        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
         if (pendingUtteranceRef.current) clearTimeout(pendingUtteranceRef.current);
-        pendingUtteranceRef.current = setTimeout(() => processCapturedSpeech(text), 280);
+        pendingUtteranceRef.current = setTimeout(() => processCapturedSpeech(text), 180);
       }
     };
 
     recognition.onend = () => {
-      if (isListeningRef.current && listenMode === 'handsfree') {
-        try {
-          recognition.start();
-        } catch {
-          // ignore
-        }
-      } else {
+      if (isListeningRef.current && recognitionRef.current === recognition) {
+        scheduleRecognitionRestart(recognition, 250);
+      } else if (!isListeningRef.current) {
         setIsListening(false);
       }
     };
 
-    recognition.onerror = () => {
-      setIsListening(false);
+    recognition.onerror = (event) => {
+      const code = event?.error || 'unknown';
+      if (code === 'no-speech' || code === 'aborted') {
+        setTurnStatusBadge({
+          type: 'ready',
+          label: '🎧 مستمع… لسه مسمعتش كلام واضح',
+          scriptProgressPct: 0
+        });
+        return;
+      }
+
+      const messages = {
+        'not-allowed': 'المتصفح رفض إذن الميكروفون. اضغط أيقونة القفل جنب العنوان ← الميكروفون ← السماح، ثم اضغط «بدء الاستماع» تاني.',
+        'service-not-allowed': 'خدمة التعرف على الكلام مش متاحة للموقع ده. جرّب Chrome/Edge، أو استخدم زر «سجّل كلام البايع» (تفريغ بالـ AI).',
+        'audio-capture': 'مفيش ميكروفون متاح أو مشغول بتطبيق تاني. وصّل ميكروفون وجرّب تاني.',
+        network: 'خدمة التعرف على الكلام محتاجة إنترنت. اتأكد من الشبكة، أو استخدم زر «سجّل كلام البايع».',
+        'language-not-supported': 'المتصفح مش بيدعم اللغة المختارة للاستماع. بدّل اللغة أو استخدم زر التسجيل.'
+      };
+      setMicError(messages[code] || `خطأ في التعرف على الصوت: ${code}`);
       isListeningRef.current = false;
+      setIsListening(false);
     };
 
     recognitionRef.current = recognition;
@@ -676,9 +819,121 @@ export default function LiveWhispererCoPilot({
       recognition.start();
       setIsListening(true);
       isListeningRef.current = true;
+      restartAttemptsRef.current = 0;
+      setTurnStatusBadge({
+        type: 'ready',
+        label: `🎧 مستمع (${activeLang === 'ar-EG' ? 'عربي' : 'English'}) — اتكلم عادي والرد هيتبني على كلامك`,
+        scriptProgressPct: 0
+      });
     } catch {
-      setIsListening(false);
+      scheduleRecognitionRestart(recognition, 400);
+      setIsListening(true);
+      isListeningRef.current = true;
     }
+  };
+
+  const switchSpeechLanguage = (next) => {
+    setSpeechLang(next);
+    speechLangRef.current = next;
+    if (isListeningRef.current) startSpeechEngine({ langOverride: next });
+  };
+
+  // ---------------------------------------------------------------------------
+  // Recorder fallback: record → Gemini transcription → same reply pipeline.
+  // Works on browsers with no Web Speech API and when the speech service fails.
+  // ---------------------------------------------------------------------------
+  const transcribeAndReply = async (blob) => {
+    if (!apiKey) {
+      setMicError('تفريغ التسجيل محتاج مفتاح Gemini API (من إعدادات الموديل فوق). أو اكتب كلام البايع في الخانة تحت.');
+      return;
+    }
+    setIsTranscribing(true);
+    setMicError('');
+    try {
+      const text = await transcribeAudioBlob({ blob, apiKey, model: selectedModel, lang });
+      if (!text) {
+        setMicError('مقدرتش أطلّع كلام واضح من التسجيل — قرّب الميكروفون واتكلم جملة كاملة، وجرّب تاني.');
+        return;
+      }
+      setHeardText(text);
+      replyToSeller(text, { source: 'transcribed' });
+    } catch {
+      setMicError('حصل خطأ أثناء تفريغ التسجيل. جرّب تاني أو اكتب الجملة يدوياً.');
+    } finally {
+      setIsTranscribing(false);
+    }
+  };
+
+  const stopRecorder = () => {
+    if (recorderTimerRef.current) clearTimeout(recorderTimerRef.current);
+    recorderTimerRef.current = null;
+    const rec = recorderRef.current;
+    if (rec && rec.state !== 'inactive') {
+      try {
+        rec.stop();
+      } catch {
+        // ignore
+      }
+    }
+  };
+
+  const startRecorder = async () => {
+    if (!isRecorderSupported()) {
+      setMicError('المتصفح ده مش بيدعم التسجيل الصوتي. اكتب كلام البايع في الخانة تحت.');
+      return;
+    }
+    try {
+      const stream =
+        micStreamRef.current ||
+        (await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true }
+        }));
+      micStreamRef.current = stream;
+      const mimeType = window.MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : 'audio/webm';
+      const rec = new MediaRecorder(stream, { mimeType });
+      recorderChunksRef.current = [];
+      rec.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) recorderChunksRef.current.push(event.data);
+      };
+      rec.onstop = async () => {
+        const chunks = recorderChunksRef.current;
+        recorderChunksRef.current = [];
+        recorderRef.current = null;
+        isRecordingRef.current = false;
+        setIsRecording(false);
+        if (!chunks.length) return;
+        await transcribeAndReply(new Blob(chunks, { type: mimeType }));
+      };
+      rec.start();
+      recorderRef.current = rec;
+      isRecordingRef.current = true;
+      setIsRecording(true);
+      setMicError('');
+      setTurnStatusBadge({
+        type: 'ready',
+        label: '🔴 جاري التسجيل — اتكلم وبعدين اضغط «وقف وسيّب النص»',
+        scriptProgressPct: 0
+      });
+      recorderTimerRef.current = setTimeout(() => stopRecorder(), RECORDER_MAX_MS);
+    } catch {
+      setMicError('مقدرتش أفتح الميكروفون للتسجيل — اتأكد من إذن الميكروفون للموقع.');
+      setIsRecording(false);
+      isRecordingRef.current = false;
+    }
+  };
+
+  const toggleRecorder = () => {
+    if (isRecordingRef.current) stopRecorder();
+    else startRecorder();
+  };
+
+  const forceUseIgnoredSpeech = () => {
+    if (!ignoredSpeech?.text) return;
+    const text = ignoredSpeech.text;
+    setIgnoredSpeech(null);
+    replyToSeller(text, { wasBargeIn: CUE_REGEX.test(text) });
   };
 
   // -------------------------------------------------------------------------
@@ -694,6 +949,9 @@ export default function LiveWhispererCoPilot({
     setLastIgnoredUserText('');
     setLiveCustomOffer(null);
     setAiError('');
+    setMicError('');
+    setHeardText('');
+    setIgnoredSpeech(null);
     setDetectedSellerTone(NEUTRAL_TONE);
     setTurnStatusBadge({
       type: 'ready',
@@ -740,6 +998,15 @@ export default function LiveWhispererCoPilot({
       stopAcousticAnalyzer();
       if (pendingUtteranceRef.current) clearTimeout(pendingUtteranceRef.current);
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
+      if (recorderTimerRef.current) clearTimeout(recorderTimerRef.current);
+      if (recorderRef.current && recorderRef.current.state !== 'inactive') {
+        try {
+          recorderRef.current.stop();
+        } catch {
+          // ignore
+        }
+      }
       if (recognitionRef.current) {
         try {
           recognitionRef.current.stop();
@@ -830,7 +1097,7 @@ export default function LiveWhispererCoPilot({
 
           <button
             type="button"
-            onClick={() => setSpeechLang((l) => (l === 'en-US' ? 'ar-EG' : 'en-US'))}
+            onClick={() => switchSpeechLanguage(speechLang === 'en-US' ? 'ar-EG' : 'en-US')}
             className={`px-3 py-1.5 rounded-xl text-xs font-bold border ${
               isLight ? 'bg-slate-100 border-slate-300 text-slate-800' : 'bg-zinc-800 border-zinc-700 text-zinc-200'
             }`}
@@ -1024,6 +1291,25 @@ export default function LiveWhispererCoPilot({
               ⚡ ده كلام البايع — رد فوراً
             </button>
           )}
+
+          <button
+            type="button"
+            onClick={toggleRecorder}
+            disabled={isTranscribing}
+            className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-extrabold border transition ${
+              isRecording
+                ? 'bg-rose-500 text-white border-rose-400 animate-pulse'
+                : isTranscribing
+                ? 'bg-amber-500/20 text-amber-300 border-amber-500/50'
+                : isLight
+                ? 'bg-white border-slate-300 text-slate-700 hover:bg-slate-100'
+                : 'bg-zinc-900 border-zinc-700 text-zinc-200 hover:bg-zinc-800'
+            }`}
+            title="مفيد لو المتصفح مش بيدعم التعرف المباشر: بيسجل صوت البايع ويحوّله نص بالـ AI"
+          >
+            <Mic className="w-3.5 h-3.5" />
+            {isRecording ? '⏹ وقف وسيّب النص' : isTranscribing ? '⏳ جاري التفريغ…' : '🎙️ سجّل كلام البايع'}
+          </button>
         </div>
 
         <div className="flex flex-wrap items-center gap-3 text-xs">
@@ -1228,6 +1514,75 @@ export default function LiveWhispererCoPilot({
           </div>
         </div>
       )}
+
+      {/* Mic diagnostics — what the browser actually heard, and why it was ignored */}
+      <div className={`rounded-xl p-3 border space-y-2 ${subBoxTheme}`}>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="text-[11px] font-extrabold uppercase tracking-wider text-sky-400">
+            🎤 حالة الميكروفون واللي اتسمع فعلاً
+          </span>
+          <span className="flex flex-wrap items-center gap-1.5 text-[10px] font-bold">
+            <span className={`px-2 py-0.5 rounded-md border ${
+              micEngine === 'webspeech'
+                ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
+                : micEngine === 'recorder'
+                ? 'bg-amber-500/15 text-amber-400 border-amber-500/30'
+                : 'bg-rose-500/15 text-rose-400 border-rose-500/30'
+            }`}>
+              {micEngine === 'webspeech'
+                ? 'محرك: تعرف مباشر (Web Speech)'
+                : micEngine === 'recorder'
+                ? 'محرك: تسجيل + تفريغ AI'
+                : 'المتصفح مش بيدعم الميكروفون'}
+            </span>
+            <span className="px-2 py-0.5 rounded-md border bg-sky-500/10 text-sky-400 border-sky-500/30">
+              لغة الاستماع: {speechLang === 'ar-EG' ? 'العربية (ar-EG)' : 'English (en-US)'}
+            </span>
+            {isListening && (
+              <span className="px-2 py-0.5 rounded-md border bg-rose-500/15 text-rose-400 border-rose-500/30 animate-pulse">
+                ● بيسجّل الكلام دلوقتي
+              </span>
+            )}
+          </span>
+        </div>
+
+        <p className={`text-[11px] ${isLight ? 'text-slate-700' : 'text-zinc-300'}`}>
+          <span className="opacity-60">آخر جملة اتسمعت: </span>
+          <span className="font-semibold">{heardText || 'لسه مفيش كلام واضح…'}</span>
+        </p>
+
+        {liveText && liveText !== heardText && (
+          <p className={`text-[11px] ${isLight ? 'text-slate-500' : 'text-zinc-400'}`}>
+            <span className="opacity-60">جاري سماعها الآن: </span>
+            <span className="italic">{liveText}</span>
+          </p>
+        )}
+
+        {ignoredSpeech && (
+          <div className="rounded-lg p-2 border border-amber-500/40 bg-amber-500/10 space-y-1.5">
+            <p className="text-[11px] font-bold text-amber-400">تم تجاهل جملة: «{ignoredSpeech.text}»</p>
+            <p className={`text-[10px] ${isLight ? 'text-slate-600' : 'text-zinc-400'}`}>{ignoredSpeech.reason}</p>
+            <button
+              type="button"
+              onClick={forceUseIgnoredSpeech}
+              className="px-2.5 py-1 rounded-lg text-[11px] font-extrabold bg-amber-500 text-slate-950 hover:bg-amber-400 transition"
+            >
+              رد على الجملة دي كأنها كلام البايع
+            </button>
+          </div>
+        )}
+
+        {micError && (
+          <div className="rounded-lg p-2 border border-rose-500/40 bg-rose-500/10">
+            <p className="text-[11px] font-bold text-rose-300 leading-relaxed">⚠️ {micError}</p>
+          </div>
+        )}
+
+        <p className={`text-[10px] leading-relaxed ${isLight ? 'text-slate-500' : 'text-zinc-500'}`}>
+          لو الميكروفون مش لاقط: بدّل اللغة لـ AR قبل بدء الاستماع، واسمع على Chrome/Edge، ودوس «🎙️ سجّل كلام البايع» كبديل
+          مضمون. أي جملة بتتسمع بتظهر فوق قبل ما الـ Co-Pilot يرد عليها.
+        </p>
+      </div>
 
       {/* Simulator */}
       <form
