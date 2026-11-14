@@ -73,7 +73,28 @@ export function NumericField({ label, value, onChange, placeholder, isLight = fa
 
 export function QuickPropertyLinks({ address, isLight }) {
   const cleanAddr = (address || '').trim();
-  const encoded = encodeURIComponent(cleanAddr || '4812 Lovell Ave Fort Worth TX');
+
+  // No address yet → no verification links. Never fall back to a demo address.
+  if (cleanAddr.length < 3) {
+    return (
+      <div className="flex flex-wrap items-center gap-1.5 mt-2">
+        <span className={`text-[10px] font-semibold uppercase tracking-wider mr-1 ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>
+          Verify:
+        </span>
+        <span
+          className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-medium border ${
+            isLight
+              ? 'bg-slate-100 text-slate-500 border-slate-300'
+              : 'bg-zinc-800/60 text-zinc-400 border-zinc-700'
+          }`}
+        >
+          أدخل عنوان العقار أولاً — لا روابط تحقق بدون عنوان
+        </span>
+      </div>
+    );
+  }
+
+  const encoded = encodeURIComponent(cleanAddr);
 
   return (
     <div className="flex flex-wrap items-center gap-1.5 mt-2">
